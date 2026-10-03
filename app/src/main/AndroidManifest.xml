@@ -4,6 +4,8 @@
 
     <!-- Session completion notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Used to detect airplane mode while a simulation is running (local-data-only notice). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Reschedule session alarms after device reboot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Keep CPU awake while the alarm receiver coroutine processes session completion -->

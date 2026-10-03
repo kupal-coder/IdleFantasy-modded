@@ -55,6 +55,7 @@ import com.fantasyidler.ui.screen.CarnivalScreen
 import com.fantasyidler.ui.screen.TowerScreen
 import com.fantasyidler.ui.screen.ChurchScreen
 import com.fantasyidler.ui.screen.MonumentScreen
+import com.fantasyidler.ui.screen.SimulatorScreen
 import com.fantasyidler.ui.screen.BuilderScreen
 import com.fantasyidler.ui.screen.CombatScreen
 import com.fantasyidler.ui.screen.ElderArmorMasterScreen
@@ -251,6 +252,7 @@ fun AppNavigation(
                     onNavigateToGuildHall    = { navController.navigate(Screen.GuildHall.route) },
                     onNavigateToChurch       = { navController.navigate(Screen.Church.route) },
                     onNavigateToMonument     = { navController.navigate(Screen.Monument.route) },
+                    onNavigateToSimulator    = { navController.navigate(Screen.Simulator.route) },
                     onNavigateToSlayer       = { navController.navigate(Screen.Slayer.route) },
                     onNavigateToBuilder      = { navController.navigate(Screen.Builder.route) },
                     onNavigateToHouse        = { navController.navigate(Screen.House.route) },
@@ -404,6 +406,11 @@ fun AppNavigation(
             }
             paneComposable(Screen.Monument.route) { entry ->
                 MonumentScreen(
+                    onBack = { if (navController.currentBackStackEntry == entry) navController.popBackStack() },
+                )
+            }
+            paneComposable(Screen.Simulator.route) { entry ->
+                SimulatorScreen(
                     onBack = { if (navController.currentBackStackEntry == entry) navController.popBackStack() },
                 )
             }

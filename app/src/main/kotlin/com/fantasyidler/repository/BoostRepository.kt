@@ -3,6 +3,7 @@ package com.fantasyidler.repository
 import com.fantasyidler.data.json.PrestigeSkillTreeData
 import com.fantasyidler.data.model.PlayerFlags
 import com.fantasyidler.data.model.Skills
+import com.fantasyidler.simulator.HardcoreRules
 import com.fantasyidler.simulator.PrestigeBoosts
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -36,15 +37,16 @@ class BoostRepository @Inject constructor(
     /**
      * Combined XP multiplier for [skill]: purchased and post-prestige 2x boosts, church
      * blessing, and prestige xp_pct nodes. Purchases and blessings are inert for ironmen.
+     * Base Reality (Very Hard) cuts all XP rates by 50% via [HardcoreRules.XP_RATE_MULT].
      */
     fun xpMultiplier(skill: String, flags: PlayerFlags, prayerCapeMult: Float, now: Long = System.currentTimeMillis()): Double {
         val prestigeMult = 1.0 + effectTotal(skill, flags, PrestigeBoosts.XP_PCT) / 100.0
         val boostMult = xpBoostFactor(skill, flags, now).toDouble()
         // Prestige effects are earned, not bought, so they apply to ironmen too; the
         // purchased boost (excluded in xpBoostFactor) and church blessings stay inert.
-        if (flags.ironman) return boostMult * prestigeMult
+        if (flags.ironman) return boostMult * prestigeMult * HardcoreRules.XP_RATE_MULT
         val blessingMult = ChurchRepository.xpMultiplier(flags, prayerCapeMult, gameData.blessings).toDouble()
-        return boostMult * blessingMult * prestigeMult
+        return boostMult * blessingMult * prestigeMult * HardcoreRules.XP_RATE_MULT
     }
 
     /** Item yield multiplier for [skill] from prestige yield_pct nodes. */
@@ -169,11 +171,11 @@ class BoostRepository @Inject constructor(
         return healValues.mapValues { (_, v) -> (v * (1.0 + pct / 100.0)).toInt().coerceAtLeast(v) }
     }
 
-    /** Fraction of XP/loot kept on combat death (base 0.10, defense + hitpoints nodes add). */
-    fun deathKeepFraction(flags: PlayerFlags): Double =
-        (0.10 + (effectTotal(Skills.DEFENSE, flags, PrestigeBoosts.DEATH_KEEP_PCT) +
-            effectTotal(Skills.HITPOINTS, flags, PrestigeBoosts.DEATH_KEEP_PCT)) / 100.0)
-            .coerceAtMost(0.60)
+    /**
+     * Fraction of XP/loot kept on combat death. Base Reality (Very Hard) death is
+     * permanent / heavily punishing: nothing is kept ([HardcoreRules.DEATH_KEEP_FRACTION]).
+     */
+    fun deathKeepFraction(flags: PlayerFlags): Double = HardcoreRules.DEATH_KEEP_FRACTION
 
     /** Extra session queue slots from prestige (gnome construction capstone). */
     fun extraQueueSlots(flags: PlayerFlags): Int =

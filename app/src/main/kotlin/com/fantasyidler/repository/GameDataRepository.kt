@@ -41,6 +41,7 @@ import com.fantasyidler.data.json.SpellData
 import com.fantasyidler.data.json.TownBuildingData
 import com.fantasyidler.data.json.TradeRouteData
 import com.fantasyidler.data.json.TreeData
+import com.fantasyidler.simulator.HardcoreRules
 import com.fantasyidler.util.GameStrings
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.serialization.json.Json
@@ -81,7 +82,8 @@ class GameDataRepository @Inject constructor(
     // ------------------------------------------------------------------ enemies
 
     val enemies: Map<String, EnemyData> by lazy {
-        asset("data/enemies.json")
+        asset<Map<String, EnemyData>>("data/enemies.json")
+            .mapValues { (_, enemy) -> HardcoreRules.hardenEnemy(enemy) }
     }
 
     /** Maps each enemy key to the dungeon display names it appears in. */
@@ -104,7 +106,7 @@ class GameDataRepository @Inject constructor(
             .filter { it.endsWith(".json") }
             .associate { filename ->
                 val data = asset<DungeonData>("data/dungeons/$filename")
-                data.name to data
+                data.name to HardcoreRules.hardenDungeon(data)
             }
     }
 
@@ -198,7 +200,8 @@ class GameDataRepository @Inject constructor(
     // ------------------------------------------------------------------ equipment
 
     val equipment: Map<String, EquipmentData> by lazy {
-        asset("data/equipment.json")
+        asset<Map<String, EquipmentData>>("data/equipment.json")
+            .mapValues { (_, eq) -> HardcoreRules.hardenGear(eq) }
     }
 
     // ------------------------------------------------------------------ recipes
@@ -208,7 +211,8 @@ class GameDataRepository @Inject constructor(
     }
 
     val cookingRecipes: Map<String, CookingRecipe> by lazy {
-        asset("data/recipes/cooking.json")
+        asset<Map<String, CookingRecipe>>("data/recipes/cooking.json")
+            .mapValues { (_, recipe) -> recipe.copy(healingValue = HardcoreRules.healAmount(recipe.healingValue)) }
     }
 
     /**

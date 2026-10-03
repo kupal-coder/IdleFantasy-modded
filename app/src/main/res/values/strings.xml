@@ -2614,4 +2614,71 @@
     <string name="shop_sell_blocked_heirloom">%1$s is an heirloom and cannot be sold.</string>
     <!-- Translator note: %1$s = a dungeon or boss name -->
     <string name="repeat_blocked_level">Your combat level is too low to repeat %1$s.</string>
+
+    <!-- ===== Reality Simulator (three-layer mod) ===== -->
+    <string name="simulator_title">Reality Simulator</string>
+    <string name="simulator_base_badge">Base Reality · Very Hard</string>
+    <string name="simulator_base_description">Base Reality is very hard: stronger enemies, rarer drops, weaker healing, and permanent death. The Simulator runs an exact parallel copy of the game from a checkpoint of your character. You keep nothing unless you select it — up to three rewards — when the run ends.</string>
+    <string name="simulator_enter">Enter Simulator</string>
+    <string name="simulator_inside_badge">Simulation Active</string>
+    <string name="simulator_inside_description">Everything you do here happens only in the temporary simulation state. Die or exit to return to Base Reality and select up to three rewards.</string>
+    <string name="simulator_exit">Exit Simulator</string>
+    <string name="simulator_current_action">Current action: %1$s</string>
+    <string name="simulator_no_action">No action running. Start a skill or combat action in the game, then return here to fast-forward it.</string>
+    <string name="simulator_time_skip">Fast Time Simulation</string>
+    <string name="simulator_time_skip_confirm_title">Fast Time Simulation</string>
+    <string name="simulator_time_skip_confirm_message">Instantly advance the current action? Results apply only to the simulation and count toward your reward pool.</string>
+    <string name="simulator_time_skip_locked">Locked — upgrade Longer Skips to unlock this duration.</string>
+    <!-- Translator note: %1$d = number of minutes -->
+    <string name="simulator_time_skip_option">%1$d min</string>
+    <string name="simulator_time_skip_result_title">Time Skip Results</string>
+    <!-- Translator note: %1$s = a skill name, %2$d = XP amount -->
+    <string name="simulator_time_skip_result_xp">%1$s: +%2$d XP</string>
+    <!-- Translator note: %1$s = an item name, %2$d = quantity -->
+    <string name="simulator_time_skip_result_item">%1$s ×%2$d</string>
+    <!-- Translator note: %1$d = coin amount -->
+    <string name="simulator_time_skip_result_coins">Coins: +%1$d</string>
+    <string name="simulator_time_skip_result_empty">Nothing was gained.</string>
+    <string name="simulator_time_skip_result_died">You died during the Time Skip.</string>
+    <string name="simulator_time_skip_unavailable">Time Skip is only available inside the Simulator.</string>
+    <string name="simulator_time_skip_no_action">Start an action before using Time Skip.</string>
+    <string name="simulator_time_skip_action_complete">The current action is already complete.</string>
+    <string name="simulator_death_title">Simulation Ended</string>
+    <string name="simulator_death_message">You died inside the Simulator. The temporary state is discarded — select up to three rewards from your gains to bring back to Base Reality.</string>
+    <string name="simulator_rewards_title">Select Rewards</string>
+    <!-- Translator note: %1$d = maximum number of rewards (3) -->
+    <string name="simulator_rewards_message">Choose up to %1$d rewards from this run to keep. Everything else is discarded.</string>
+    <string name="simulator_rewards_empty">No gains were made in this run. Nothing to bring back.</string>
+    <string name="simulator_reward_group_stats">Stats</string>
+    <string name="simulator_reward_group_skill_xp">Skill Experience</string>
+    <string name="simulator_reward_group_items">Items</string>
+    <!-- Translator note: %1$d = number of levels, %2$s = a skill name -->
+    <string name="simulator_reward_level">+%1$d %2$s Level</string>
+    <!-- Translator note: %1$d = coin amount -->
+    <string name="simulator_reward_coins">+%1$d Coins</string>
+    <!-- Translator note: %1$d = XP amount, %2$s = a skill name -->
+    <string name="simulator_reward_xp">+%1$d %2$s XP</string>
+    <!-- Translator note: %1$s = an item name, %2$d = quantity -->
+    <string name="simulator_reward_item">%1$s ×%2$d</string>
+    <!-- Translator note: %1$d = selected count, %2$d = maximum (3) -->
+    <string name="simulator_reward_count">%1$d / %2$d selected</string>
+    <string name="simulator_claim_return">Claim and Return to Base Reality</string>
+    <string name="simulator_return_message">Returned to Base Reality.</string>
+    <string name="simulator_upgrades_title">Simulator Upgrades</string>
+    <string name="simulator_upgrades_description">Upgrades are bought in Base Reality and persist permanently.</string>
+    <string name="simulator_upgrade_skip_duration">Longer Skips</string>
+    <!-- Translator note: %1$d = maximum skip length in minutes -->
+    <string name="simulator_upgrade_skip_duration_desc">Unlocks longer Fast Time Simulation skips (current max: %1$d min).</string>
+    <string name="simulator_upgrade_efficiency">Better Efficiency</string>
+    <!-- Translator note: %1$d = bonus percent per level -->
+    <string name="simulator_upgrade_efficiency_desc">Time Skip results +%1$d%% per level.</string>
+    <!-- Translator note: %1$d = current level, %2$d = maximum level -->
+    <string name="simulator_upgrade_level">Level %1$d / %2$d</string>
+    <string name="simulator_upgrade_maxed">Max level</string>
+    <!-- Translator note: %1$d = price in coins -->
+    <string name="simulator_upgrade_buy">Buy — %1$d coins</string>
+    <string name="simulator_upgrade_not_enough_coins">Not enough coins.</string>
+    <string name="simulator_upgrade_purchased">Simulator upgraded.</string>
+    <string name="simulator_error">An unexpected error occurred. Returning to Base Reality.</string>
+    <string name="simulator_offline">You are offline. Simulation continues with local data only.</string>
 </resources>

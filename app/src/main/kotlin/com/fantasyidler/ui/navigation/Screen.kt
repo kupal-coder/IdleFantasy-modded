@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MenuBook
+import androidx.compose.material.icons.filled.Science
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.ShowChart
@@ -141,6 +142,12 @@ sealed class Screen(
         route    = "monument",
         labelRes = R.string.monument_title,
         icon     = Icons.Filled.AccountBalance,
+    )
+
+    object Simulator : Screen(
+        route    = "simulator",
+        labelRes = R.string.simulator_title,
+        icon     = Icons.Filled.Science,
     )
 
     object GuildDetail : Screen(

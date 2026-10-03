@@ -116,6 +116,27 @@ object CombatSimulator {
             val frameArrows = mutableMapOf<String, Int>()
             var frameRunesUsed = 0
 
+            // Encounter gate: minutes that aren't a resumed fight only meet an enemy
+            // [DungeonData.encounterRate] of the time (Base Reality clamps this to
+            // 0.35–0.50), so quiet minutes gain — and lose — nothing.
+            if (carryoverEnemyKey == null && rnd.nextDouble() >= dungeon.encounterRate) {
+                frames.add(
+                    SessionFrame(
+                        minute       = minute,
+                        xpGain       = 0,
+                        xpBefore     = runningTotal,
+                        xpAfter      = runningTotal,
+                        levelBefore  = 0,
+                        levelAfter   = 0,
+                        hpAfter      = currentHp.coerceAtLeast(0),
+                        maxHp        = maxHp,
+                        foodAtStart  = if (frames.isEmpty()) equippedFood else emptyMap(),
+                        statsAtStart = if (frames.isEmpty()) statsAtStart else emptyMap(),
+                    )
+                )
+                continue
+            }
+
             var enemyKey = carryoverEnemyKey ?: spawnPool[rnd.nextInt(spawnPool.size)]
             carryoverEnemyKey = null
             var enemy    = enemies[enemyKey] ?: continue
