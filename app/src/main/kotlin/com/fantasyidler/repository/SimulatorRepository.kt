@@ -15,10 +15,16 @@ class SimulatorRepository @Inject constructor(
 ) {
     private val mutex = Mutex()
     private var checkpoint: SimulatorCheckpoint? = null
+    private var state: SimulatorState = SimulatorState.BASE_REALITY
+    private var action: (suspend (Int, SimulatorCheckpoint) -> Unit)? = null
+
+    enum class SimulatorState { BASE_REALITY, ENTERING, ACTIVE, TIME_SKIP_CONFIRM, TIME_SKIP_RESULT, DEATH, REWARD_SELECTION, RETURNING }
 
     suspend fun enter(player: Player): Boolean = mutex.withLock {
         if (checkpoint?.active == true) return@withLock false
+        state = SimulatorState.ENTERING
         checkpoint = SimulatorCheckpoint.enter(player)
+        state = SimulatorState.ACTIVE
         true
     }
 
@@ -26,8 +32,18 @@ class SimulatorRepository @Inject constructor(
 
     suspend fun temporaryPlayer(): Player? = mutex.withLock { checkpoint?.temporary }
 
+    suspend fun setAction(rateCalculator: suspend (Int, SimulatorCheckpoint) -> Unit) = mutex.withLock {
+        action = rateCalculator
+    }
+
     suspend fun timeSkip(minutes: Int): Int = mutex.withLock {
-        checkpoint?.skip(minutes) ?: 0
+        val current = checkpoint ?: return@withLock 0
+        if (!current.active || state != SimulatorState.ACTIVE) return@withLock 0
+        state = SimulatorState.TIME_SKIP_CONFIRM
+        val effectiveMinutes = current.skip(minutes)
+        action?.invoke(effectiveMinutes, current)
+        state = SimulatorState.TIME_SKIP_RESULT
+        effectiveMinutes
     }
 
     suspend fun recordItem(key: String, quantity: Int) = mutex.withLock {
@@ -39,12 +55,28 @@ class SimulatorRepository @Inject constructor(
     }
 
     suspend fun finish(): List<RewardCategory> = mutex.withLock {
+        if (checkpoint == null) return@withLock emptyList()
+        state = SimulatorState.REWARD_SELECTION
         checkpoint?.finish() ?: emptyList()
+    }
+
+    suspend fun state(): SimulatorState = mutex.withLock { state }
+
+    suspend fun selectedRewards(categories: Set<RewardCategory>): Map<RewardCategory, Any> = mutex.withLock {
+        if (categories.size > 3) return@withLock emptyMap()
+        val run = checkpoint ?: return@withLock emptyMap()
+        buildMap {
+            if (RewardCategory.STATS in categories) put(RewardCategory.STATS, run.gainedStats.toMap())
+            if (RewardCategory.SKILL_EXPERIENCE in categories) put(RewardCategory.SKILL_EXPERIENCE, run.gainedSkillXp.toMap())
+            if (RewardCategory.ITEMS in categories) put(RewardCategory.ITEMS, run.gainedItems.toMap())
+        }
     }
 
     suspend fun leave() = mutex.withLock {
         checkpoint?.discard()
         checkpoint = null
+        action = null
+        state = SimulatorState.BASE_REALITY
     }
 
     suspend fun upgrade(): Int = mutex.withLock {
