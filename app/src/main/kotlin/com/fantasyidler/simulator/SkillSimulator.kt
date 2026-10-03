@@ -1,5 +1,6 @@
 package com.fantasyidler.simulator
 
+import com.fantasyidler.ModInit
 import com.fantasyidler.data.json.AgilityCourseData
 import com.fantasyidler.data.json.FishData
 import com.fantasyidler.data.json.GatheringSkillData
@@ -70,7 +71,7 @@ object SkillSimulator {
             val levelBefore = XpTable.levelForXp(currentXp)
 
             val baseXp = (oreData.xpPerOre * toolEfficiency).toInt()
-            val xpGain = applyPetBoost(baseXp, petBoostPct)
+            val xpGain = ModInit.experience(applyPetBoost(baseXp, petBoostPct).toLong())
 
             currentXp += xpGain
             val levelAfter = XpTable.levelForXp(currentXp)
@@ -139,7 +140,7 @@ object SkillSimulator {
             val levelBefore = XpTable.levelForXp(currentXp)
 
             val baseXp = (treeData.xpPerLog * toolEfficiency).toInt()
-            val xpGain = applyPetBoost(baseXp, petBoostPct)
+            val xpGain = ModInit.experience(applyPetBoost(baseXp, petBoostPct).toLong())
 
             currentXp += xpGain
             val levelAfter = XpTable.levelForXp(currentXp)
@@ -196,7 +197,7 @@ object SkillSimulator {
             val levelBefore = XpTable.levelForXp(currentXp)
 
             val baseXp = (fishData.xpPerCatch * rodEfficiency).toInt()
-            val xpGain = applyPetBoost(baseXp, petBoostPct)
+            val xpGain = ModInit.experience(applyPetBoost(baseXp, petBoostPct).toLong())
 
             currentXp += xpGain
             val levelAfter = XpTable.levelForXp(currentXp)
@@ -269,7 +270,7 @@ object SkillSimulator {
 
             val xpRange = getTierData(skillData.xpRanges, levelBefore)
             val baseXp = (random.nextInt(xpRange.min, xpRange.max + 1) * toolEfficiency).toInt()
-            val xpGain = applyPetBoost(baseXp, petBoostPct)
+            val xpGain = ModInit.experience(applyPetBoost(baseXp, petBoostPct).toLong())
 
             currentXp += xpGain
             val levelAfter = XpTable.levelForXp(currentXp)
@@ -347,7 +348,7 @@ object SkillSimulator {
 
             val successfulLaps = (0 until lapsPerMinute).count { random.nextDouble() < successRate }
             val baseXp = successfulLaps * courseData.xpPerSuccess
-            val xpGain = applyPetBoost(baseXp, petBoostPct)
+            val xpGain = ModInit.experience(applyPetBoost(baseXp, petBoostPct).toLong())
 
             currentXp += xpGain
             val levelAfter = XpTable.levelForXp(currentXp)

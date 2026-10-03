@@ -1,5 +1,6 @@
 package com.fantasyidler.simulator
 
+import com.fantasyidler.ModInit
 import com.fantasyidler.data.json.BossData
 import com.fantasyidler.data.json.DungeonData
 import com.fantasyidler.data.json.EnemyData
@@ -140,19 +141,19 @@ object CombatSimulator {
                     "ranged" -> {
                         playerMaxHit = rangedMaxHit(effRanged, rangedGearStrengthBonus, 0)
                         playerEffAtk = effRanged + weaponAttackBonus
-                        enemyDefStat = enemy.defensiveStats.rangedDefense
+                        enemyDefStat = ModInit.combatStat(enemy.defensiveStats.rangedDefense)
                     }
                     "magic" -> {
                         playerMaxHit = spellMaxHit.coerceAtLeast(1)
                         playerEffAtk = effMagic + weaponAttackBonus
-                        enemyDefStat = enemy.defensiveStats.magicDefense
+                        enemyDefStat = ModInit.combatStat(enemy.defensiveStats.magicDefense)
                     }
                     else -> {
                         val effStr   = effStrength + weaponStrengthBonus
                         playerMaxHit = max(1, 1 + effStr * (weaponStrengthBonus + 64) / 640)
                         playerEffAtk = effAttack + weaponAttackBonus
-                        enemyDefStat = if (combatStyle == "strength") enemy.defensiveStats.strengthDefense
-                                       else enemy.defensiveStats.attackDefense
+                        enemyDefStat = if (combatStyle == "strength") ModInit.combatStat(enemy.defensiveStats.strengthDefense)
+                                       else ModInit.combatStat(enemy.defensiveStats.attackDefense)
                     }
                 }
                 playerHitChance = when {
@@ -162,9 +163,9 @@ object CombatSimulator {
                         playerEffAtk / (2.0 * enemyDefStat.coerceAtLeast(1))
                 }.coerceIn(0.15, 0.95)
 
-                val enemyEffStr = enemy.combatStats.strengthLevel + enemy.combatStats.strengthBonus
-                enemyMaxHit     = if (enemyEffStr == 0) 0 else max(0, 1 + enemyEffStr * (enemy.combatStats.strengthBonus + 64) / 640)
-                val enemyEffAtk = enemy.combatStats.attackLevel + enemy.combatStats.attackBonus
+                val enemyEffStr = ModInit.combatStat(enemy.combatStats.strengthLevel) + ModInit.combatStat(enemy.combatStats.strengthBonus)
+                enemyMaxHit     = if (enemyEffStr == 0) 0 else max(0, 1 + enemyEffStr * (ModInit.combatStat(enemy.combatStats.strengthBonus) + 64) / 640)
+                val enemyEffAtk = ModInit.combatStat(enemy.combatStats.attackLevel) + ModInit.combatStat(enemy.combatStats.attackBonus)
                 enemyHitChance  = when {
                     enemyEffAtk > effDefence ->
                         1.0 - effDefence / (2.0 * enemyEffAtk.coerceAtLeast(1))
@@ -176,7 +177,7 @@ object CombatSimulator {
 
             // --- Tick-by-tick combat loop ---
             val savedCarryoverHp = carryoverEnemyHp.also { carryoverEnemyHp = 0 }
-            var enemyHp = if (savedCarryoverHp > 0) savedCarryoverHp else enemy.hp
+            var enemyHp = if (savedCarryoverHp > 0) savedCarryoverHp else ModInit.enemyHp(enemy.hp)
             var kills = 0
             val framePlayerHits  = mutableListOf<Int>()
             val frameEnemyHits   = mutableListOf<Int>()
@@ -229,14 +230,14 @@ object CombatSimulator {
                         frameItems[drop.item] = (frameItems[drop.item] ?: 0) + drop.quantity
                     }
                     for (drop in enemy.dropTable) {
-                        if (rnd.nextDouble() < drop.chance) {
+                        if (rnd.nextDouble() < ModInit.dropChance(drop.chance)) {
                             val qty = if (drop.quantityMin >= drop.quantityMax) drop.quantityMin
                                       else rnd.nextInt(drop.quantityMin, drop.quantityMax + 1)
                             frameItems[drop.item] = (frameItems[drop.item] ?: 0) + qty
                         }
                     }
                     val baseXp = (enemy.xpDrops["combat"] ?: 0).toLong()
-                    val xp     = if (petBoostPct > 0) (baseXp * (1.0 + petBoostPct / 100.0)).toLong() else baseXp
+                    val xp     = ModInit.experience(if (petBoostPct > 0) (baseXp * (1.0 + petBoostPct / 100.0)).toLong() else baseXp)
                     for ((skill, skillXp) in distributeXp(xp, combatStyle)) {
                         frameXpBySkill[skill] = (frameXpBySkill[skill] ?: 0L) + skillXp
                     }
@@ -821,9 +822,9 @@ object CombatSimulator {
         for (spawn in dungeon.enemySpawns) {
             val enemy = enemies[spawn.enemy] ?: continue
             val weight      = spawn.weight.toDouble() / totalWeight
-            val enemyEffStr = enemy.combatStats.strengthLevel + enemy.combatStats.strengthBonus
-            val enemyMaxHit = if (enemyEffStr == 0) 0 else max(0, 1 + enemyEffStr * (enemy.combatStats.strengthBonus + 64) / 640)
-            val enemyEffAtk = enemy.combatStats.attackLevel + enemy.combatStats.attackBonus
+            val enemyEffStr = ModInit.combatStat(enemy.combatStats.strengthLevel) + ModInit.combatStat(enemy.combatStats.strengthBonus)
+            val enemyMaxHit = if (enemyEffStr == 0) 0 else max(0, 1 + enemyEffStr * (ModInit.combatStat(enemy.combatStats.strengthBonus) + 64) / 640)
+            val enemyEffAtk = ModInit.combatStat(enemy.combatStats.attackLevel) + ModInit.combatStat(enemy.combatStats.attackBonus)
             val enemyHit    = when {
                 enemyEffAtk > playerDefence -> 1.0 - playerDefence / (2.0 * enemyEffAtk.coerceAtLeast(1))
                 else                        -> enemyEffAtk / (2.0 * playerDefence.coerceAtLeast(1))

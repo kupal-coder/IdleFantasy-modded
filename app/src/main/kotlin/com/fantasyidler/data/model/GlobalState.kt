@@ -19,4 +19,5 @@ object GlobalStateKey {
     const val ONBOARDING_COMPLETE = "onboarding_complete"
     /** 1-based save slot the live DB currently holds. Absent = 1 (pre-slots installs). */
     const val ACTIVE_SAVE_SLOT    = "active_save_slot"
+    const val SIMULATOR_UPGRADE_LEVEL = "simulator_upgrade_level"
 }
