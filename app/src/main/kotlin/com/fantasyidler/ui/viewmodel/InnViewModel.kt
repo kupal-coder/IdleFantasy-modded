@@ -12,6 +12,7 @@ import com.fantasyidler.data.model.WorkerTier
 import com.fantasyidler.repository.GameDataRepository
 import com.fantasyidler.repository.PlayerRepository
 import com.fantasyidler.repository.SessionRepository
+import com.fantasyidler.simulator.HardcoreRules
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -168,9 +169,10 @@ class InnViewModel @Inject constructor(
         val large  = recipes.filter { it.healingValue >= 15 }
 
         return listOfNotNull(
-            small.randomOrNull(rng)?.let  { DailyFoodItem(it.cookedItem, it.displayName, it.healingValue, 100) },
-            medium.randomOrNull(rng)?.let { DailyFoodItem(it.cookedItem, it.displayName, it.healingValue, 250) },
-            large.randomOrNull(rng)?.let  { DailyFoodItem(it.cookedItem, it.displayName, it.healingValue, 500) },
+            // Base Reality (Very Hard): healing is more expensive.
+            small.randomOrNull(rng)?.let  { DailyFoodItem(it.cookedItem, it.displayName, it.healingValue, HardcoreRules.healCost(100)) },
+            medium.randomOrNull(rng)?.let { DailyFoodItem(it.cookedItem, it.displayName, it.healingValue, HardcoreRules.healCost(250)) },
+            large.randomOrNull(rng)?.let  { DailyFoodItem(it.cookedItem, it.displayName, it.healingValue, HardcoreRules.healCost(500)) },
         )
     }
 }

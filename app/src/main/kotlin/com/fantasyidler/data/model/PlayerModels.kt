@@ -341,6 +341,18 @@ data class PlayerFlags(
     /** True once the first-arrival welcome splash has been shown on Elder Isle. Stops
      *  the splash from popping every time you sail back after that first landing. */
     @SerialName("elder_isle_welcomed") val elderIsleWelcomed: Boolean = false,
+    /**
+     * Simulator upgrades purchased in Base Reality: upgrade key (see
+     * [com.fantasyidler.simulator.RealitySimulator]) -> level. Persists across
+     * simulations — upgrades are part of the real save, never the temporary state.
+     */
+    @SerialName("simulator_upgrades") val simulatorUpgrades: Map<String, Int> = emptyMap(),
+    /**
+     * Epoch ms when the active Simulator run started; non-zero while a simulation is in
+     * progress. Survives a force-close so the next launch can discard the run
+     * ("An unexpected error occurred. Returning to Base Reality.").
+     */
+    @SerialName("sim_run_active_since") val simRunActiveSince: Long = 0L,
 )
 
 /** One completed bulk sell: what was sold and what it paid. */

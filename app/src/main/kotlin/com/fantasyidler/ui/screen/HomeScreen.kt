@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Science
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.ShoppingCart
@@ -106,6 +107,7 @@ fun HomeScreen(
     onNavigateToGuildHall: () -> Unit = {},
     onNavigateToChurch: () -> Unit = {},
     onNavigateToMonument: () -> Unit = {},
+    onNavigateToSimulator: () -> Unit = {},
     onNavigateToSlayer: () -> Unit = {},
     onNavigateToBuilder: () -> Unit = {},
     onNavigateToHouse: () -> Unit = {},
@@ -717,6 +719,12 @@ fun HomeScreen(
                             TownGridCard(Icons.Filled.Celebration,    stringResource(R.string.carnival_title), onClick = onNavigateToCarnival, modifier = Modifier.weight(1f))
                             TownGridCard(Icons.Filled.AccountBalance, stringResource(R.string.monument_title), onClick = onNavigateToMonument, modifier = Modifier.weight(1f))
                             TownGridCard(Icons.Filled.Home,           stringResource(R.string.house_title),    onClick = onNavigateToHouse,    modifier = Modifier.weight(1f))
+                        }
+                        Row(
+                            modifier              = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            TownGridCard(Icons.Filled.Science, stringResource(R.string.simulator_title), onClick = onNavigateToSimulator, modifier = Modifier.weight(1f))
                         }
                         // Show the Set Sail button as soon as the Dock is built, even before
                         // the Sea Serpent falls. Pre-kill tap surfaces the "defeat the Sea
