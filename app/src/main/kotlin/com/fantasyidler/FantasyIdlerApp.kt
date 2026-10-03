@@ -13,5 +13,6 @@ class FantasyIdlerApp : Application() {
     override fun onCreate() {
         super.onCreate()
         notificationManager.createChannels()
+        ModInit.init(this)
     }
 }

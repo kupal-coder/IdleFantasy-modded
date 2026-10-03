@@ -1,5 +1,6 @@
 package com.fantasyidler.simulator
 
+import com.fantasyidler.ModInit
 import com.fantasyidler.data.json.BossData
 import com.fantasyidler.data.json.DungeonData
 import com.fantasyidler.data.json.EnemyData
@@ -176,7 +177,7 @@ object CombatSimulator {
 
             // --- Tick-by-tick combat loop ---
             val savedCarryoverHp = carryoverEnemyHp.also { carryoverEnemyHp = 0 }
-            var enemyHp = if (savedCarryoverHp > 0) savedCarryoverHp else enemy.hp
+            var enemyHp = if (savedCarryoverHp > 0) savedCarryoverHp else ModInit.enemyHp(enemy.hp)
             var kills = 0
             val framePlayerHits  = mutableListOf<Int>()
             val frameEnemyHits   = mutableListOf<Int>()
@@ -229,14 +230,14 @@ object CombatSimulator {
                         frameItems[drop.item] = (frameItems[drop.item] ?: 0) + drop.quantity
                     }
                     for (drop in enemy.dropTable) {
-                        if (rnd.nextDouble() < drop.chance) {
+                        if (rnd.nextDouble() < ModInit.dropChance(drop.chance)) {
                             val qty = if (drop.quantityMin >= drop.quantityMax) drop.quantityMin
                                       else rnd.nextInt(drop.quantityMin, drop.quantityMax + 1)
                             frameItems[drop.item] = (frameItems[drop.item] ?: 0) + qty
                         }
                     }
                     val baseXp = (enemy.xpDrops["combat"] ?: 0).toLong()
-                    val xp     = if (petBoostPct > 0) (baseXp * (1.0 + petBoostPct / 100.0)).toLong() else baseXp
+                    val xp     = ModInit.experience(if (petBoostPct > 0) (baseXp * (1.0 + petBoostPct / 100.0)).toLong() else baseXp)
                     for ((skill, skillXp) in distributeXp(xp, combatStyle)) {
                         frameXpBySkill[skill] = (frameXpBySkill[skill] ?: 0L) + skillXp
                     }

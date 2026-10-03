@@ -2614,4 +2614,9 @@
     <string name="shop_sell_blocked_heirloom">%1$s is an heirloom and cannot be sold.</string>
     <!-- Translator note: %1$s = a dungeon or boss name -->
     <string name="repeat_blocked_level">Your combat level is too low to repeat %1$s.</string>
+    <string name="simulator_unexpected_error">An unexpected error occurred. Returning to Base Reality.</string>
+    <string name="simulator_offline">You are offline. Simulation continues with local data only.</string>
+    <string name="simulator_reward_stats">Stats</string>
+    <string name="simulator_reward_skill_experience">Skill Experience</string>
+    <string name="simulator_reward_items">Items obtained</string>
 </resources>
