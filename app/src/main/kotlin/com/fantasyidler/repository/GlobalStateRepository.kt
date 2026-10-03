@@ -28,6 +28,13 @@ class GlobalStateRepository @Inject constructor(
     suspend fun getActiveSaveSlot(): Int =
         dao.getValue(GlobalStateKey.ACTIVE_SAVE_SLOT)?.toIntOrNull() ?: 1
 
+    suspend fun simulatorUpgradeLevel(): Int =
+        dao.getValue(GlobalStateKey.SIMULATOR_UPGRADE_LEVEL)?.toIntOrNull()?.coerceIn(0, 10) ?: 0
+
+    suspend fun setSimulatorUpgradeLevel(level: Int) {
+        dao.setValue(GlobalState(GlobalStateKey.SIMULATOR_UPGRADE_LEVEL, level.coerceIn(0, 10).toString(), System.currentTimeMillis()))
+    }
+
     suspend fun setActiveSaveSlot(slot: Int) {
         dao.setValue(GlobalState(
             key       = GlobalStateKey.ACTIVE_SAVE_SLOT,
