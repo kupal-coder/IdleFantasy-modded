@@ -34,7 +34,6 @@ import com.fantasyidler.simulator.RealitySimulator.RewardKind
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.serializer
 import org.junit.After
@@ -157,6 +156,10 @@ class SimulatorIsolationTest {
     private fun decodeFrames(session: SkillSession): List<SessionFrame> =
         json.decodeFromString(session.frames)
 
+    /** Explicit two-arg encode, matching PlayerRepository's helper (no reified-form ambiguity). */
+    private fun encodeFlags(flags: PlayerFlags): String =
+        json.encodeToString(json.serializersModule.serializer<PlayerFlags>(), flags)
+
     /** A Base Reality character: level 10 mining, some combat levels, and a stocked bag. */
     private suspend fun seedPlayer(flags: PlayerFlags = PlayerFlags()) {
         realPlayerDao.upsert(
@@ -167,7 +170,7 @@ class SimulatorIsolationTest {
                 equipped    = """{}""",
                 pets        = """[]""",
                 coins       = 1_000L,
-                flags       = json.encodeToString<PlayerFlags>(flags),
+                flags       = encodeFlags(flags),
             )
         )
     }
@@ -780,7 +783,7 @@ class SimulatorIsolationTest {
         seedBaseReality()
         realPlayerDao.upsert(
             realPlayerDao.getPlayer()!!.copy(
-                flags = json.encodeToString<PlayerFlags>(
+                flags = encodeFlags(
                     PlayerFlags(
                         simulatorUpgrades = mapOf(
                             RealitySimulator.UPGRADE_SKIP_DURATION to 2,
