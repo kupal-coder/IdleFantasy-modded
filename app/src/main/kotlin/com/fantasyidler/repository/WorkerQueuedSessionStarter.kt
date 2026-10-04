@@ -40,10 +40,10 @@ class WorkerQueuedSessionStarter @Inject constructor(
 ) {
     private val mutex = Mutex()
 
-    suspend fun startNextQueued(slot: Int = 1): Boolean {
-        return playerRepo.playerMutex.withLock {
+    suspend fun startNextQueued(slot: Int = 1, playerMutexHeld: Boolean = false): Boolean {
+        return playerRepo.withLockUnlessHeld(playerMutexHeld) {
             mutex.withLock {
-                val current = sessionRepo.getActiveWorkerSession(slot)
+                val current = sessionRepo.getActiveWorkerSession(slot, playerMutexHeld = true)
                 if (current != null && !current.completed) return@withLock false
                 var next = playerRepo.dequeueNextWorkerActionUnlocked(slot)
                 while (next != null) {
@@ -315,7 +315,7 @@ class WorkerQueuedSessionStarter @Inject constructor(
                     attackSpeedSec     = bossWeapon?.attackSpeed ?: CombatSimulator.BASE_ATTACK_SPEED_SEC,
                     eatThresholdPct    = flags.foodEatThresholdPct,
                     foodEatOrder       = flags.foodEatOrder,
-                    blockedRareDrops   = HeirloomStats.ownedHeirloomKeys(gameData.equipment, inventory) + sessionRepo.pendingHeirloomKeys(),
+                    blockedRareDrops   = HeirloomStats.ownedHeirloomKeys(gameData.equipment, inventory) + sessionRepo.pendingHeirloomKeys(playerMutexHeld = true),
                 )
                 startSession(slot, action, bossFrames, durationMs, efficiencyMultiplier, levelAtStart)
             }

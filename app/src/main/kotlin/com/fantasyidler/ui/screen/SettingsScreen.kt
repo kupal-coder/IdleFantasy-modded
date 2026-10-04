@@ -93,6 +93,9 @@ fun SettingsScreen(
     var showResetConfirm1    by remember { mutableStateOf(false) }
     var showResetConfirm2    by remember { mutableStateOf(false) }
     var showChangelogDialog  by remember { mutableStateOf(false) }
+    // An import or reset refused because a Simulator run owns the character it would replace.
+    val blockedMessage       by viewModel.blockedMessage.collectAsState()
+    AppBannerEffect(blockedMessage, onConsumed = viewModel::consumeBlockedMessage)
 
     val folderLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()

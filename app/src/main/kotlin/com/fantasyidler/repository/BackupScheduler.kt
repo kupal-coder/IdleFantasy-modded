@@ -104,15 +104,27 @@ class BackupScheduler @Inject constructor(
         var tempUri: Uri? = null
         var failureMsg = ""
         val ok = try {
-            val sessions = buildList {
-                sessionRepo.getActiveSession()?.let { add(it.toExport()) }
-                addAll(sessionRepo.getAllCompletedSessions().map { it.toExport() })
-                for (slot in 1..2) {
-                    sessionRepo.getActiveWorkerSession(slot)?.let { add(it.toExport()) }
-                    addAll(sessionRepo.getAllCompletedWorkerSessions(slot).map { it.toExport() })
+            // The snapshot below spans the player row and every session table, so it is taken
+            // under the Simulator lifecycle lock: the bare flag check above can pass and then
+            // lose the race against enterSimulation(), which flips the flag between the
+            // session reads and playerRepo.exportSave() and would export half-isolated state
+            // (simulated sessions with a real player row, or the reverse). Holding the lock
+            // makes "no run is active" and the snapshot it authorises one atomic step. The
+            // document writes stay outside it so a slow provider cannot stall a run.
+            val jsonBytes = RealitySimulator.withSimulatorLock {
+                if (RealitySimulator.isSimulationActive) null
+                else {
+                    val sessions = buildList {
+                        sessionRepo.getActiveSession()?.let { add(it.toExport()) }
+                        addAll(sessionRepo.getAllCompletedSessions().map { it.toExport() })
+                        for (slot in 1..2) {
+                            sessionRepo.getActiveWorkerSession(slot)?.let { add(it.toExport()) }
+                            addAll(sessionRepo.getAllCompletedWorkerSessions(slot).map { it.toExport() })
+                        }
+                    }
+                    playerRepo.exportSave(sessions).toByteArray()
                 }
-            }
-            val jsonBytes = playerRepo.exportSave(sessions).toByteArray()
+            } ?: return false
             val treeUri   = Uri.parse(flags.backupFolderUri)
             val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
             val cr        = context.contentResolver

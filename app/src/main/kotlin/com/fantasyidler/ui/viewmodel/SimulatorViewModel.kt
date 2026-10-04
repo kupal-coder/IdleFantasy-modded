@@ -97,17 +97,6 @@ class SimulatorViewModel @Inject constructor(
         }
     }
 
-    fun exitSimulation() {
-        viewModelScope.launch {
-            try {
-                RealitySimulator.exitSimulation(playerRepo, sessionRepo, activeSlot())
-                refreshRewardPool()
-            } catch (e: Exception) {
-                abortWithCrashMessage()
-            }
-        }
-    }
-
     fun acknowledgeDeath() {
         viewModelScope.launch {
             try {
@@ -138,8 +127,14 @@ class SimulatorViewModel @Inject constructor(
 
     fun cancelTimeSkip() = RealitySimulator.cancelTimeSkip()
 
+    /** True while a Time Skip is in flight: a second tap must not queue a second skip. */
+    @Volatile
+    private var skipInProgress = false
+
     fun confirmTimeSkip(minutes: Int) {
+        if (skipInProgress) return
         viewModelScope.launch {
+            skipInProgress = true
             try {
                 if (!RealitySimulator.canTimeSkip()) {
                     _extra.update { it.copy(message = context.withAppLocale().getString(R.string.simulator_time_skip_unavailable)) }
@@ -165,6 +160,8 @@ class SimulatorViewModel @Inject constructor(
                 }
             } catch (e: Exception) {
                 abortWithCrashMessage()
+            } finally {
+                skipInProgress = false
             }
         }
     }
@@ -186,7 +183,7 @@ class SimulatorViewModel @Inject constructor(
     fun claimRewards() {
         viewModelScope.launch {
             try {
-                val claimed = RealitySimulator.claimRewards(playerRepo, uiState.value.selectedRewards, activeSlot())
+                val claimed = RealitySimulator.claimRewards(playerRepo, uiState.value.selectedRewards.toList(), activeSlot())
                 _extra.update {
                     it.copy(
                         selectedRewards = emptySet(),
@@ -231,20 +228,27 @@ class SimulatorViewModel @Inject constructor(
 
     // ------------------------------------------------------------------ upgrades (Base Reality)
 
+    /**
+     * Upgrades are bought in Base Reality, so the "no run active" check and the purchase have
+     * to be one lifecycle operation: otherwise a run starting in between would take the coins
+     * from the real save and write the upgrade into the simulation, losing both.
+     */
     fun buyUpgrade(upgradeKey: String) {
         viewModelScope.launch {
             try {
-                if (RealitySimulator.isSimulationActive) return@launch
-                val flags = playerRepo.getFlags()
-                val level = RealitySimulator.upgradeLevel(flags, upgradeKey)
-                val cost = RealitySimulator.upgradeCost(upgradeKey, level)
-                if (cost < 0L) return@launch
-                if (!playerRepo.spendCoins(cost)) {
-                    _extra.update { it.copy(message = context.withAppLocale().getString(R.string.simulator_upgrade_not_enough_coins)) }
-                    return@launch
+                val message = RealitySimulator.withSimulatorLock<String?> {
+                    if (RealitySimulator.isSimulationActive) return@withSimulatorLock null
+                    val flags = playerRepo.getFlags()
+                    val level = RealitySimulator.upgradeLevel(flags, upgradeKey)
+                    val cost = RealitySimulator.upgradeCost(upgradeKey, level)
+                    if (cost < 0L) return@withSimulatorLock null
+                    if (!playerRepo.spendCoins(cost)) {
+                        return@withSimulatorLock context.withAppLocale().getString(R.string.simulator_upgrade_not_enough_coins)
+                    }
+                    playerRepo.updateFlags(flags.copy(simulatorUpgrades = flags.simulatorUpgrades + (upgradeKey to level + 1)))
+                    context.withAppLocale().getString(R.string.simulator_upgrade_purchased)
                 }
-                playerRepo.updateFlags(flags.copy(simulatorUpgrades = flags.simulatorUpgrades + (upgradeKey to level + 1)))
-                _extra.update { it.copy(message = context.withAppLocale().getString(R.string.simulator_upgrade_purchased)) }
+                if (message != null) _extra.update { it.copy(message = message) }
             } catch (e: Exception) {
                 abortWithCrashMessage()
             }

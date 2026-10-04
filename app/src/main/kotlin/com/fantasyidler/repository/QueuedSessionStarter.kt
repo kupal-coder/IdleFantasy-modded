@@ -93,13 +93,13 @@ class QueuedSessionStarter @Inject constructor(
      * Returns true if a session was started, false if the queue was empty or the
      * session couldn't be started (e.g. missing materials).
      */
-    suspend fun startNextQueued(backdateMs: Long = 0L): Boolean {
+    suspend fun startNextQueued(backdateMs: Long = 0L, playerMutexHeld: Boolean = false): Boolean {
         // Mutex covers the full dequeue + session-start so concurrent callers (alarm
         // receiver, recoverActiveSession, collectSession) can't both pass the "no running
         // session" check and dequeue separate actions before either inserts a DB row.
-        return playerRepo.playerMutex.withLock {
+        return playerRepo.withLockUnlessHeld(playerMutexHeld) {
             mutex.withLock {
-                val current = sessionRepo.getActiveSession()
+                val current = sessionRepo.getActiveSession(playerMutexHeld = true)
                 if (current != null && !current.completed) return@withLock false
                 // A boss queued with a fight-count > 1 (CombatViewModel.startBossSession) isn't
                 // re-enqueued as N separate queue entries -- the progress lives in PlayerFlags
@@ -222,7 +222,7 @@ class QueuedSessionStarter @Inject constructor(
      * exceeds what the entry gate approved.
      */
     private suspend fun actualChargeMs(estimateMs: Long): Long {
-        val session = sessionRepo.getActiveSession() ?: return estimateMs
+        val session = sessionRepo.getActiveSession(playerMutexHeld = true) ?: return estimateMs
         val endMs = if (session.skillName == "boss") sessionRepo.bossFightEndMs(session) else session.endsAt
         return (endMs - session.startedAt).coerceIn(1L, estimateMs)
     }
@@ -247,8 +247,8 @@ class QueuedSessionStarter @Inject constructor(
      *
      * Called from [SessionRepository.recoverActiveSession] to reconstruct offline progress.
      */
-    suspend fun insertNextQueuedAsOffline(remainingMs: Long): Long {
-        return playerRepo.playerMutex.withLock {
+    suspend fun insertNextQueuedAsOffline(remainingMs: Long, playerMutexHeld: Boolean = false): Long {
+        return playerRepo.withLockUnlessHeld(playerMutexHeld) {
             mutex.withLock {
                 val player = playerRepo.getOrCreatePlayer()
                 val levels: Map<String, Int> = json.decodeFromString(player.skillLevels)
@@ -270,7 +270,7 @@ class QueuedSessionStarter @Inject constructor(
                 // sessionQueue scan below preserves the "don't let another queue item jump an
                 // in-progress chain" guarantee from issue #1167.
                 if (flags.activeBossRepeatSnapshot != null && flags.activeBossRepeatIndex < flags.activeBossRepeatTotal) {
-                    val current = sessionRepo.getActiveSession()
+                    val current = sessionRepo.getActiveSession(playerMutexHeld = true)
                     if (current == null || !current.completed || current.skillName != "boss") return@withLock 0L
                     val won = (json.decodeFromString<List<SessionFrame>>(current.frames).lastOrNull()?.kills ?: 0) > 0
                     if (!won) {
@@ -291,7 +291,7 @@ class QueuedSessionStarter @Inject constructor(
                 }
                 // Same idea as the boss repeat chain above, but for dungeon runs (issue #1167 / #1189).
                 if (flags.activeDungeonRepeatSnapshot != null && flags.activeDungeonRepeatIndex < flags.activeDungeonRepeatTotal) {
-                    val current = sessionRepo.getActiveSession()
+                    val current = sessionRepo.getActiveSession(playerMutexHeld = true)
                     if (current == null || !current.completed || current.skillName != "combat") return@withLock 0L
                     val survived = json.decodeFromString<List<SessionFrame>>(current.frames).lastOrNull()?.died != true
                     if (!survived) {
@@ -358,10 +358,10 @@ class QueuedSessionStarter @Inject constructor(
      * Debug helper: completes the active session and fast-forwards any remaining
      * boss/dungeon repeat runs as completed sessions so Collect gathers all of them.
      */
-    suspend fun debugFinishActiveSessionWithRepeats() {
-        playerRepo.playerMutex.withLock {
+    suspend fun debugFinishActiveSessionWithRepeats(playerMutexHeld: Boolean = false) {
+        playerRepo.withLockUnlessHeld(playerMutexHeld) {
             mutex.withLock {
-                sessionRepo.getActiveSession()?.let { if (!it.completed) sessionRepo.markCompleted(it.sessionId) }
+                sessionRepo.getActiveSession(playerMutexHeld = true)?.let { if (!it.completed) sessionRepo.markCompleted(it.sessionId, playerMutexHeld = true) }
 
                 var flags = playerRepo.getFlagsUnlocked()
                 val snapshot = flags.activeBossRepeatSnapshot ?: flags.activeDungeonRepeatSnapshot ?: return@withLock
@@ -814,7 +814,7 @@ class QueuedSessionStarter @Inject constructor(
                     // Queued raids use the contracts valid when the session actually starts,
                     // matching how queued sessions already use the current armor.
                     mercenaries         = if (boss.raid) mercRepo.combatants(flags) else emptyList(),
-                    blockedRareDrops    = HeirloomStats.ownedHeirloomKeys(gameData.equipment, inventory) + sessionRepo.pendingHeirloomKeys(),
+                    blockedRareDrops    = HeirloomStats.ownedHeirloomKeys(gameData.equipment, inventory) + sessionRepo.pendingHeirloomKeys(playerMutexHeld = true),
                 )
                 val frameMs        = effectiveSessionMs / 60L
                 val bossDurationMs = boss.durationMinutes * frameMs
@@ -938,7 +938,7 @@ class QueuedSessionStarter @Inject constructor(
                 // was otherwise the only skill where finishing a session wasn't enough to keep
                 // the queue moving (issue #1183). A death still halts the chain so the player
                 // sees it and can decide whether to keep climbing from the checkpoint.
-                val pendingTower = sessionRepo.getAllCompletedSessions().lastOrNull { it.skillName == "tower" }
+                val pendingTower = sessionRepo.getAllCompletedSessions(playerMutexHeld = true).lastOrNull { it.skillName == "tower" }
                 val pendingFloor = pendingTower?.activityKey?.removePrefix("tower_floor_")?.toIntOrNull()
                 if (pendingTower != null) {
                     val pendingFrames: List<SessionFrame> = json.decodeFromString(pendingTower.frames)
@@ -1087,7 +1087,7 @@ class QueuedSessionStarter @Inject constructor(
      * Used so the next queued combat session doesn't get the full pre-battle food supply.
      */
     private suspend fun pendingFoodConsumed(): Map<String, Int> {
-        val session = sessionRepo.getActiveSession() ?: return emptyMap()
+        val session = sessionRepo.getActiveSession(playerMutexHeld = true) ?: return emptyMap()
         if (!session.completed || session.skillName !in listOf("combat", "boss")) return emptyMap()
         val frames = try { json.decodeFromString<List<SessionFrame>>(session.frames) } catch (_: Exception) { return emptyMap() }
         val result = mutableMapOf<String, Int>()

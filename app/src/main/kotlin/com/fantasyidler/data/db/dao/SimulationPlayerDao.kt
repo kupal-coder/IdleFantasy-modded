@@ -34,6 +34,14 @@ class SimulationPlayerDao(
         RealitySimulator.simPlayer.map { simulated ->
             if (RealitySimulator.isSimulationActive) simulated else delegate.getPlayer()
         },
+        // Entering or leaving a simulation must re-resolve which player observers are served
+        // even when neither the real row nor the simulated one changed on its own: without
+        // this, an observer that subscribed before entry (every screen is subscribed through
+        // PlayerRepository.playerFlow) is never re-triggered and stays pointed at Base Reality
+        // until something happens to write. Same on the way out.
+        RealitySimulator.phase.map {
+            if (RealitySimulator.isSimulationActive) RealitySimulator.simPlayer.value else delegate.getPlayer()
+        },
     )
 
     override suspend fun upsert(player: Player) {
