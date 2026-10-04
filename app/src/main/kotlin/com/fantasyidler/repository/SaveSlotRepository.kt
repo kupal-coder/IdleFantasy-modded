@@ -7,6 +7,7 @@ import com.fantasyidler.data.model.PlayerFlags
 import com.fantasyidler.data.model.SkillSessionExport
 import com.fantasyidler.data.model.toExport
 import com.fantasyidler.data.model.toSkillSession
+import com.fantasyidler.simulator.RealitySimulator
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -197,6 +198,12 @@ class SaveSlotRepository @Inject constructor(
         switchMutex.withLock {
             val current = globalStateRepo.getActiveSaveSlot()
             if (targetSlot == current) return@withLock false
+
+            // A Simulator run is bound to the character/save slot that started it: switching
+            // would leave its isolated state — and its claimable rewards — pointing at a
+            // character that is no longer loaded. Refuse until the run is finished or discarded
+            // (SaveSlotsViewModel surfaces the message; this guards every other caller).
+            if (RealitySimulator.isSimulationActive) return@withLock false
 
             // Back up the outgoing character to its own external file while it is still live,
             // so an inactive character always has a fresh backup to restore from (issue #1640:

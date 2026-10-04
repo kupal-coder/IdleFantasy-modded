@@ -8,6 +8,8 @@ import androidx.lifecycle.viewModelScope
 import com.fantasyidler.R
 import com.fantasyidler.data.model.PlayerFlags
 import com.fantasyidler.data.model.SkillSession
+import com.fantasyidler.repository.BoostRepository
+import com.fantasyidler.repository.GlobalStateRepository
 import com.fantasyidler.repository.PlayerRepository
 import com.fantasyidler.repository.SessionRepository
 import com.fantasyidler.simulator.RealitySimulator
@@ -37,6 +39,7 @@ data class SimulatorUiState(
     val rewardPool: List<SimReward> = emptyList(),
     val selectedRewards: Set<SimReward> = emptySet(),
     val crashedNotice: Boolean = false,
+    val runInvalidated: Boolean = false,
     val offline: Boolean = false,
     val message: String? = null,
 )
@@ -45,6 +48,8 @@ data class SimulatorUiState(
 class SimulatorViewModel @Inject constructor(
     private val playerRepo: PlayerRepository,
     private val sessionRepo: SessionRepository,
+    private val boostRepo: BoostRepository,
+    private val globalStateRepo: GlobalStateRepository,
     @ApplicationContext private val context: Context,
     private val json: Json,
 ) : ViewModel() {
@@ -69,6 +74,7 @@ class SimulatorViewModel @Inject constructor(
                 activeSession      = if (RealitySimulator.isSimulationActive) session else null,
                 lastSkipResult     = skipResult,
                 crashedNotice      = RealitySimulator.crashedLastRun.value,
+                runInvalidated     = RealitySimulator.runInvalidated.value,
             )
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SimulatorUiState())
@@ -82,7 +88,7 @@ class SimulatorViewModel @Inject constructor(
     fun enterSimulation() {
         viewModelScope.launch {
             try {
-                RealitySimulator.enterSimulation(playerRepo)
+                RealitySimulator.enterSimulation(playerRepo, sessionRepo, activeSlot())
                 refreshRewardPool()
                 refreshOffline()
             } catch (e: Exception) {
@@ -94,7 +100,7 @@ class SimulatorViewModel @Inject constructor(
     fun exitSimulation() {
         viewModelScope.launch {
             try {
-                RealitySimulator.exitSimulation(playerRepo, sessionRepo)
+                RealitySimulator.exitSimulation(playerRepo, sessionRepo, activeSlot())
                 refreshRewardPool()
             } catch (e: Exception) {
                 abortWithCrashMessage()
@@ -105,7 +111,7 @@ class SimulatorViewModel @Inject constructor(
     fun acknowledgeDeath() {
         viewModelScope.launch {
             try {
-                RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo)
+                RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, activeSlot())
                 refreshRewardPool()
             } catch (e: Exception) {
                 abortWithCrashMessage()
@@ -145,7 +151,7 @@ class SimulatorViewModel @Inject constructor(
                     _extra.update { it.copy(message = context.withAppLocale().getString(R.string.simulator_time_skip_no_action)) }
                     return@launch
                 }
-                val result = RealitySimulator.timeSkip(playerRepo, sessionRepo, minutes)
+                val result = RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, minutes, activeSlot())
                 if (result.minutes == 0) {
                     RealitySimulator.cancelTimeSkip()
                     _extra.update {
@@ -180,12 +186,13 @@ class SimulatorViewModel @Inject constructor(
     fun claimRewards() {
         viewModelScope.launch {
             try {
-                RealitySimulator.claimRewards(playerRepo, uiState.value.selectedRewards)
+                val claimed = RealitySimulator.claimRewards(playerRepo, uiState.value.selectedRewards, activeSlot())
                 _extra.update {
                     it.copy(
                         selectedRewards = emptySet(),
                         rewardPool      = emptyList(),
-                        message         = context.withAppLocale().getString(R.string.simulator_return_message),
+                        // A rejected claim raises its own notice; don't also announce a clean return.
+                        message         = if (claimed) context.withAppLocale().getString(R.string.simulator_return_message) else null,
                     )
                 }
             } catch (e: Exception) {
@@ -197,15 +204,25 @@ class SimulatorViewModel @Inject constructor(
     fun skipRewards() {
         viewModelScope.launch {
             try {
-                RealitySimulator.claimRewards(playerRepo, emptyList())
+                val claimed = RealitySimulator.claimRewards(playerRepo, emptyList(), activeSlot())
                 _extra.update {
                     it.copy(selectedRewards = emptySet(), rewardPool = emptyList(),
-                        message = context.withAppLocale().getString(R.string.simulator_return_message))
+                        message = if (claimed) context.withAppLocale().getString(R.string.simulator_return_message) else null)
                 }
             } catch (e: Exception) {
                 abortWithCrashMessage()
             }
         }
+    }
+
+    /**
+     * The character/save slot every Simulator operation is bound to. A run whose slot no longer
+     * matches is rejected by [RealitySimulator.ownsRun] rather than applied to another character.
+     */
+    private suspend fun activeSlot(): Int = try {
+        globalStateRepo.getActiveSaveSlot()
+    } catch (_: Exception) {
+        0
     }
 
     private fun refreshRewardPool() {
@@ -241,6 +258,11 @@ class SimulatorViewModel @Inject constructor(
     fun consumeCrashNotice() {
         RealitySimulator.consumeCrashNotice()
         _extra.update { it.copy(crashedNotice = false) }
+    }
+
+    fun consumeInvalidRunNotice() {
+        RealitySimulator.consumeInvalidRunNotice()
+        _extra.update { it.copy(runInvalidated = false) }
     }
 
     fun refreshOffline() {

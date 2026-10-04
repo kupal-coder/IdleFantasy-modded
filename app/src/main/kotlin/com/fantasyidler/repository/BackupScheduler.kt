@@ -10,6 +10,7 @@ import android.net.Uri
 import android.util.Log
 import com.fantasyidler.data.model.toExport
 import com.fantasyidler.receiver.BackupAlarmReceiver
+import com.fantasyidler.simulator.RealitySimulator
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.util.Calendar
 import javax.inject.Inject
@@ -90,6 +91,11 @@ class BackupScheduler @Inject constructor(
             Log.w(TAG, "Backup reschedule failed", e)
         }
         if (flags.backupFolderUri.isEmpty()) return false
+        // A Simulator run's state is temporary: an alarm firing mid-run must not persist it as
+        // this character's backup, or restoring that file would overwrite Base Reality with
+        // simulated values. The periodic chain was already rescheduled above, so the next
+        // firing backs up as usual.
+        if (RealitySimulator.isSimulationActive) return false
         // Per-character file names: each save slot keeps its own backups, so switching
         // characters no longer overwrites another character's auto backup.
         val activeSlot = globalStateRepo.getActiveSaveSlot()

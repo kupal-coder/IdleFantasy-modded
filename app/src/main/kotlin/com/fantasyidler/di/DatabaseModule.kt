@@ -44,7 +44,8 @@ object DatabaseModule {
 
     /** Wrapped so an active RealitySimulator run never writes the real player save. */
     @Provides fun providePlayerDao(db: AppDatabase): PlayerDao = SimulationPlayerDao(db.playerDao())
-    @Provides fun provideSkillSessionDao(db: AppDatabase): SkillSessionDao = db.skillSessionDao()
+    /** Wrapped so an active RealitySimulator run never reads or writes the real session table. */
+    @Provides fun provideSkillSessionDao(db: AppDatabase): SkillSessionDao = SimulationSessionDao(db.skillSessionDao())
     @Provides fun provideQuestProgressDao(db: AppDatabase): QuestProgressDao = db.questProgressDao()
     @Provides fun provideFarmingPatchDao(db: AppDatabase): FarmingPatchDao = db.farmingPatchDao()
     @Provides fun provideGlobalStateDao(db: AppDatabase): GlobalStateDao = db.globalStateDao()
