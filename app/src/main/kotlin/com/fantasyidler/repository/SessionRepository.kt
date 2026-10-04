@@ -13,6 +13,7 @@ import com.fantasyidler.data.model.SessionFrame
 import com.fantasyidler.data.model.SkillSession
 import com.fantasyidler.receiver.SessionAlarmReceiver
 import com.fantasyidler.simulator.CombatSimulator
+import com.fantasyidler.simulator.RealitySimulator
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.sync.Mutex
@@ -414,6 +415,10 @@ class SessionRepository @Inject constructor(
     }
 
     private fun scheduleAlarm(sessionId: String, endsAt: Long, skillDisplayName: String) {
+        // Sessions started inside a Simulator run live only in the isolated session table, so
+        // arming a real alarm for one would fire against a session Base Reality never had. The
+        // in-app watchdog and Time Skip complete isolated sessions instead.
+        if (RealitySimulator.isSimulationActive) return
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val pi = alarmIntent(sessionId, skillDisplayName)
         try {
@@ -424,6 +429,11 @@ class SessionRepository @Inject constructor(
     }
 
     internal fun cancelAlarm(sessionId: String) {
+        // An isolated session can share a real session's id (the run starts from a copy of the
+        // table), so completing/abandoning/deleting it inside a simulation must not cancel Base
+        // Reality's alarm: that real session still needs it, and cancelling it would defer its
+        // completion to the watchdog.
+        if (RealitySimulator.isSimulationActive) return
         try {
             val am      = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
             val pending = cancelIntent(sessionId)

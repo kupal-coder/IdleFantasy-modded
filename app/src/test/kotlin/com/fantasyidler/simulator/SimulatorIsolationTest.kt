@@ -1,5 +1,6 @@
 package com.fantasyidler.simulator
 
+import android.app.AlarmManager
 import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
@@ -45,6 +46,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 import javax.inject.Provider
 
@@ -453,6 +455,44 @@ class SimulatorIsolationTest {
         assertFalse(realSessionDao.getActiveWorkerSession(1)!!.completed)
         assertEquals(listOf("worker_completed"), realSessionDao.getAllCompletedWorkerSessions(2).map { it.sessionId })
         assertNull(realSessionDao.getSession("sim_worker"))
+    }
+
+    @Test
+    fun `a simulation neither arms nor cancels base reality alarms`() = runBlocking {
+        seedBaseReality()
+        val shadow = Shadows.shadowOf(context.getSystemService(Context.ALARM_SERVICE) as AlarmManager)
+
+        // Outside a run, starting a session arms its real completion alarm.
+        val real = sessionRepo.startSession(
+            skillName        = "mining",
+            activityKey      = "iron_ore",
+            frames           = encodeFrames(miningFrames(5)),
+            skillDisplayName = "Mining",
+        )
+        val armedBefore = shadow.scheduledAlarms.size
+        assertTrue("the real session should have armed its completion alarm", armedBefore > 0)
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        sessionRepo.startSession(
+            skillName        = "fishing",
+            activityKey      = "shrimp",
+            frames           = encodeFrames(miningFrames(5)),
+            skillDisplayName = "Fishing",
+        )
+        // The run starts from a copy of the real table, so these ids are also real sessions:
+        // completing and abandoning them must not cancel Base Reality's alarms.
+        sessionRepo.markCompleted(real.sessionId)
+        sessionRepo.abandonSession(real.sessionId)
+        assertEquals("a run must not arm or cancel Base Reality alarms", armedBefore, shadow.scheduledAlarms.size)
+
+        RealitySimulator.abortToBaseReality(playerRepo, sessionRepo)
+        sessionRepo.startSession(
+            skillName        = "mining",
+            activityKey      = "iron_ore",
+            frames           = encodeFrames(miningFrames(5)),
+            skillDisplayName = "Mining",
+        )
+        assertEquals("outside the run alarms are armed again", armedBefore + 1, shadow.scheduledAlarms.size)
     }
 
     // ------------------------------------------------------------------ Time Skip
