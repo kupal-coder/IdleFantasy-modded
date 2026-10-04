@@ -7,19 +7,19 @@ import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.darkColorScheme
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.fantasyidler.R
 import com.fantasyidler.data.json.ThemeData
 import com.fantasyidler.data.model.CustomTheme
 import com.fantasyidler.data.model.PlayerFlags
 import com.fantasyidler.repository.BackupScheduler
 import com.fantasyidler.repository.DailyQuestRepository
-import com.fantasyidler.repository.FarmingRepository
 import com.fantasyidler.repository.GuildRepository
 import com.fantasyidler.repository.PlayerRepository
-import com.fantasyidler.repository.QuestRepository
 import com.fantasyidler.repository.SaveSlotRepository
-import com.fantasyidler.repository.SessionRepository
 import com.fantasyidler.repository.ThemeRepository
 import com.fantasyidler.repository.WeeklyQuestRepository
+import com.fantasyidler.simulator.RealitySimulator
+import com.fantasyidler.util.withAppLocale
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,10 +43,7 @@ data class BackupStatus(
 class SettingsViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val playerRepo: PlayerRepository,
-    private val sessionRepo: SessionRepository,
-    private val questRepo: QuestRepository,
     private val backupScheduler: BackupScheduler,
-    private val farmingRepo: FarmingRepository,
     private val saveSlotRepo: SaveSlotRepository,
     private val themeRepo: ThemeRepository,
     private val dailyQuestRepo: DailyQuestRepository,
@@ -391,12 +388,29 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    /**
+     * One-shot banner text for an operation that was refused because a Simulator run owns the
+     * character it would have replaced (see [blockedBySimulation]).
+     */
+    private val _blockedMessage = MutableStateFlow<String?>(null)
+    val blockedMessage: StateFlow<String?> = _blockedMessage
+
+    fun consumeBlockedMessage() { _blockedMessage.value = null }
+
+    /** True while a Simulator run is bound to the character an import/reset would replace. */
+    fun blockedBySimulation(): Boolean = RealitySimulator.isSimulationActive
+
+    /** Refusal message for [blockedBySimulation], in the app's language. */
+    fun blockedBySimulationMessage(): String =
+        context.withAppLocale().getString(R.string.simulator_replace_blocked)
+
     fun resetProgression() {
         viewModelScope.launch {
-            sessionRepo.deleteAllSessions()
-            questRepo.resetAllProgress()
-            farmingRepo.resetAllPatches()
-            playerRepo.resetProgression()
+            // A Simulator run is bound to the character this erases: refuse instead of wiping
+            // sessions, quests, and farming patches out from under a run the player is in.
+            if (!saveSlotRepo.resetProgression()) {
+                _blockedMessage.value = blockedBySimulationMessage()
+            }
         }
     }
 
@@ -417,6 +431,13 @@ class SettingsViewModel @Inject constructor(
 
     fun importSave(jsonString: String, onDone: (success: Boolean, ironmanDemoted: Boolean) -> Unit) {
         viewModelScope.launch {
+            // Same rule as [resetProgression]: an import replaces the character a Simulator run
+            // is checkpointed from, so refuse while one is active instead of stranding it.
+            if (blockedBySimulation()) {
+                _blockedMessage.value = blockedBySimulationMessage()
+                onDone(false, false)
+                return@launch
+            }
             try {
                 val ironmanDemoted = saveSlotRepo.importFullSave(jsonString)
                 onDone(true, ironmanDemoted)

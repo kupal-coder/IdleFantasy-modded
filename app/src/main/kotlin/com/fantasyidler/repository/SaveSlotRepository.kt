@@ -111,8 +111,15 @@ class SaveSlotRepository @Inject constructor(
      * pass below completes them and catches up the queue exactly as if the app had been closed.
      * Session/buff/backup alarms are re-registered for the restored character.
      * Returns true if an edited ironman save was demoted to a regular character.
+     *
+     * Throws [IllegalStateException] while a Simulator run is active: every path below
+     * replaces state a run is bound to (the player row, its sessions, quests and farming
+     * patches), and the run is refused rather than torn down underneath the player. Callers
+     * that can be reached from the UI check [RealitySimulator.isSimulationActive] first and
+     * surface a message; this is the hard guard for every other caller.
      */
     suspend fun importFullSave(jsonString: String, freezeSessionTimers: Boolean = true): Boolean {
+        if (RealitySimulator.isSimulationActive) throw IllegalStateException("simulation active")
         val (export, ironmanDemoted) = playerRepo.importSave(jsonString)
         // Imported flags may predate the guild-leveling rework (reputation -> daily-count),
         // and importing overwrites the current save's migration state wholesale, so this
@@ -253,7 +260,11 @@ class SaveSlotRepository @Inject constructor(
             marker.delete()
             return@withContext false
         }
-        switchMutex.withLock {
+        val recovered = switchMutex.withLock {
+            // A run cannot survive the process that started it, so this only ever runs in Base
+            // Reality; refuse rather than tear one down if one is somehow still active, and let
+            // the marker retry on the next launch.
+            if (RealitySimulator.isSimulationActive) return@withLock false
             switchInProgress = true
             try {
                 val target = slotFile(targetSlot)
@@ -261,11 +272,27 @@ class SaveSlotRepository @Inject constructor(
                 globalStateRepo.setActiveSaveSlot(targetSlot)
                 pendingSwitchFile().delete()
                 _switchEvents.tryEmit(Unit)
+                true
             } finally {
                 switchInProgress = false
             }
         }
-        true
+        recovered
+    }
+
+    /**
+     * Wipes the current character: every session, all quest progress, every farming patch, and
+     * the player row itself. Returns false (and changes nothing) while a Simulator run is
+     * active — a run is bound to the character being erased, and non-isolated state (quests,
+     * farming, sessions) must not be rewritten underneath a run the player is still inside.
+     */
+    suspend fun resetProgression(): Boolean {
+        if (RealitySimulator.isSimulationActive) return false
+        sessionRepo.deleteAllSessions()
+        questRepo.resetAllProgress()
+        farmingRepo.resetAllPatches()
+        playerRepo.resetProgression()
+        return true
     }
 
     /** Deletes an INACTIVE slot's files permanently. The active slot cannot be deleted here. */

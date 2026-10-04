@@ -177,6 +177,18 @@ object RealitySimulator {
      */
     private val simulatorMutex = Mutex()
 
+    /**
+     * Runs [block] while holding the Simulator lifecycle lock, so it can never be concurrent
+     * with entering, leaving, discarding, or Time Skipping a run.
+     *
+     * For callers that read a whole-save snapshot spanning several tables (a backup export
+     * reads the player, every session, quests and farming patches) and must never see a half
+     * switched simulator: without this, entering a run halfway through the read would capture
+     * isolated simulation state as this character's real save.
+     */
+    internal suspend fun <T> withSimulatorLock(block: suspend () -> T): T =
+        simulatorMutex.withLock { block() }
+
     /** Session id the Time Skip cursor belongs to; resets when the current action changes. */
     @Volatile
     private var fastForwardSessionId: String? = null

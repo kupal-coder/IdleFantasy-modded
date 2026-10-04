@@ -6,6 +6,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.fantasyidler.data.db.AppDatabase
+import com.fantasyidler.data.db.dao.PlayerDao
 import com.fantasyidler.data.db.dao.SimulationPlayerDao
 import com.fantasyidler.data.db.dao.SimulationSessionDao
 import com.fantasyidler.data.db.dao.SkillSessionDao
@@ -38,10 +39,14 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.serializer
 import org.junit.After
@@ -287,6 +292,19 @@ class SimulatorIsolationTest {
         return base
     }
 
+    /**
+     * Waits for [predicate] to hold, letting other coroutines run instead of sleeping on
+     * wall-clock time: the flows this harness drives are dispatched on [Dispatchers.Unconfined],
+     * so a yield is enough for a pending emission to land. Bounded so a missing emission fails
+     * the test instead of hanging it — nothing here sleeps, so a slow machine cannot make it
+     * flaky, and there is no window in which a correct run would look like a failure.
+     */
+    private suspend fun waitFor(timeoutMs: Long = 5_000L, predicate: () -> Boolean): Boolean =
+        withTimeoutOrNull(timeoutMs) {
+            while (!predicate()) yield()
+            true
+        } ?: false
+
     private suspend fun realSessions(): List<SkillSession> =
         realSessionDao.getAllSessions().sortedBy { it.sessionId }
 
@@ -346,6 +364,42 @@ class SimulatorIsolationTest {
         }
         assertNotNull("playerFlow kept serving the simulated player after the run ended", restored)
         assertBaseRealityUnchanged(realBefore)
+    }
+
+    @Test
+    fun `an observer subscribed before the run switches to the simulated player and back`() = runBlocking {
+        seedBaseReality()
+        // This delegate stands in for Base Reality's row: it changes only when this test says
+        // so, which makes "did the observer switch?" a question about the simulator alone.
+        // (The real Room DAO emits asynchronously, so a test built on it could only assert
+        // after an arbitrary wait; here every emission is delivered on this thread.)
+        val base = realPlayerDao.getPlayer()!!.copy(coins = 999_999L)
+        val baseFlow = MutableStateFlow<Player?>(base)
+        val observed = SimulationPlayerDao(object : PlayerDao by realPlayerDao {
+            override fun observePlayer(): Flow<Player?> = baseFlow
+            override suspend fun getPlayer(): Player? = baseFlow.value
+        })
+        val seen = mutableListOf<Player?>()
+        val collector = launch(Dispatchers.Unconfined) { observed.observePlayer().collect { seen += it } }
+
+        assertTrue("no Base Reality player was ever observed", waitFor { seen.isNotEmpty() })
+        assertEquals("the observer should start on Base Reality", 999_999L, seen.last()!!.coins)
+
+        // Entering writes nothing to Base Reality's row, so only the switch itself can move an
+        // already-subscribed observer over: re-subscribing (a fresh collect) would hide this.
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        assertEquals(Phase.IN_SIMULATION, RealitySimulator.phase.value)
+        assertTrue(
+            "an observer subscribed before entry stayed pointed at Base Reality",
+            waitFor { seen.last()?.coins == 1_000L },
+        )
+
+        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        assertTrue(
+            "an observer kept serving the simulated player after the run ended",
+            waitFor { seen.last()?.coins == 999_999L },
+        )
+        collector.cancel()
     }
 
     @Test
@@ -1228,7 +1282,7 @@ class SimulatorIsolationTest {
     }
 
     @Test
-    fun `a run active while the character is replaced cannot keep writing simulated state`() = runBlocking {
+    fun `an import is refused while a run is active and leaves the run untouched`() = runBlocking {
         seedBaseReality()
         val characterA = playerRepo.exportSave(emptyList())
         playerRepo.resetProgression()
@@ -1238,19 +1292,62 @@ class SimulatorIsolationTest {
         RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
         RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
         assertTrue(RealitySimulator.isSimulationActive)
+        val simCoinsBefore = RealitySimulator.simPlayer.value!!.coins
+        val characterACoins = json.decodeFromString<PlayerExport>(characterA).coins
+        val baseCoinsBefore = realPlayerDao.getPlayer()!!.coins
+        val xpBefore = realXp()
 
-        saveSlotRepo.importFullSave(characterB)
+        // Refused outright: the run is bound to the character being replaced, so the import
+        // must not tear it down or strand it on a save it was never started from.
+        val refused = try {
+            saveSlotRepo.importFullSave(characterB)
+            false
+        } catch (_: IllegalStateException) {
+            true
+        }
+        assertTrue("an import must be refused while a simulation is active", refused)
 
-        assertFalse(RealitySimulator.isSimulationActive)
-        assertTrue(RealitySimulator.simSessions.value.isEmpty())
-        assertNull(RealitySimulator.simPlayer.value)
-        assertEquals(Phase.BASE_REALITY, RealitySimulator.phase.value)
-        // The import hit Base Reality, not the temporary state: the imported character is the
-        // one now loaded, with none of the simulated gains on it.
-        val importedB: PlayerExport = json.decodeFromString(characterB)
-        assertEquals(json.decodeFromString<Map<String, Long>>(importedB.skillXp), realXp())
-        assertEquals(json.decodeFromString<Map<String, Int>>(importedB.inventory), realInventory())
-        assertEquals(importedB.coins, realPlayerDao.getPlayer()!!.coins)
+        // The run is exactly as the refused import found it, and still claimable/exitable.
+        assertTrue(RealitySimulator.isSimulationActive)
+        RealitySimulator.dismissTimeSkipResult()
+        assertEquals(Phase.IN_SIMULATION, RealitySimulator.phase.value)
+        assertEquals(4, RealitySimulator.simSessions.value.size)
+        assertEquals(simCoinsBefore, RealitySimulator.simPlayer.value!!.coins)
+        assertEquals("base reality moved during the refused import", baseCoinsBefore, realPlayerDao.getPlayer()!!.coins)
+        assertEquals(xpBefore, realXp())
+        assertEquals(
+            "the refused import must not have loaded another character",
+            characterACoins, realPlayerDao.getPlayer()!!.coins,
+        )
+        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        assertTrue("a refused import must not have discarded the rewards", RealitySimulator.rewardPool().isNotEmpty())
+    }
+
+    @Test
+    fun `a progression reset is refused while a run is active and leaves the run untouched`() = runBlocking {
+        seedBaseReality()
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
+        val simCoinsBefore = RealitySimulator.simPlayer.value!!.coins
+        val baseCoinsBefore = realPlayerDao.getPlayer()!!.coins
+
+        assertFalse("a reset must be refused while a simulation is active", saveSlotRepo.resetProgression())
+
+        // Nothing was wiped: the run keeps its sessions and the character keeps its progress.
+        assertTrue(RealitySimulator.isSimulationActive)
+        assertEquals(simCoinsBefore, RealitySimulator.simPlayer.value!!.coins)
+        assertEquals(baseCoinsBefore, realPlayerDao.getPlayer()!!.coins)
+        assertNotNull(realInventory()["iron_ore"])
+        assertNotNull("the refused reset must not have wiped base sessions", realSessionDao.getActiveSession())
+        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        assertTrue(RealitySimulator.rewardPool().isNotEmpty())
+    }
+
+    @Test
+    fun `a reset outside a simulation still wipes the character`() = runBlocking {
+        seedBaseReality()
+        assertTrue(saveSlotRepo.resetProgression())
+        assertEquals(0L, realXp()["mining"])
         assertNull(realInventory()["iron_ore"])
     }
 
