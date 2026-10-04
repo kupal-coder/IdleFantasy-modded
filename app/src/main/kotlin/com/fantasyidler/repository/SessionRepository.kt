@@ -42,19 +42,18 @@ class SessionRepository @Inject constructor(
     fun activeWorkerSessionFlow(slot: Int): Flow<SkillSession?> =
         sessionDao.observeActiveWorkerSession(slot)
 
-    suspend fun getActiveSession(): SkillSession? = sessionDao.getActiveSession()
+    /** Direct (no-boundary) read of all sessions; used by RealitySimulator snapshot while
+     *  already under playerMutex lock. Not for general use. */
+    internal suspend fun getAllSessionsDirect(): List<SkillSession> = sessionDao.getAllSessions()
 
+    suspend fun getActiveSession(): SkillSession? = RealitySimulator.withSimulatorBoundary { sessionDao.getActiveSession() }
     suspend fun getActiveWorkerSession(slot: Int): SkillSession? =
-        sessionDao.getActiveWorkerSession(slot)
-
+        RealitySimulator.withSimulatorBoundary { sessionDao.getActiveWorkerSession(slot) }
     suspend fun getAllCompletedWorkerSessions(slot: Int): List<SkillSession> =
-        sessionDao.getAllCompletedWorkerSessions(slot)
-
-    suspend fun deleteAllWorkerSessions(slot: Int) = sessionDao.deleteAllWorkerSessions(slot)
-    suspend fun deleteAllWorkerSessions() = sessionDao.deleteAllWorkerSessions()
-
-    /**
-     * Persist a new session and schedule an AlarmManager alarm for completion.
+        RealitySimulator.withSimulatorBoundary { sessionDao.getAllCompletedWorkerSessions(slot) }
+    suspend fun deleteAllWorkerSessions(slot: Int) = RealitySimulator.withSimulatorBoundary { sessionDao.deleteAllWorkerSessions(slot) }
+    suspend fun deleteAllWorkerSessions() = RealitySimulator.withSimulatorBoundary { sessionDao.deleteAllWorkerSessions() }
+    /*   * Persist a new session and schedule an AlarmManager alarm for completion.
      *
      * @param skillName        canonical skill key, e.g. "mining"
      * @param activityKey      sub-activity key, e.g. "iron_ore" or "dark_cave"
@@ -77,7 +76,7 @@ class SessionRepository @Inject constructor(
         weaponSlot: String? = null,
         playerMutexHeld: Boolean = false,
         isElderSession: Boolean = false,
-    ): SkillSession {
+    ): SkillSession { RealitySimulator.withSimulatorBoundary {
         val now = System.currentTimeMillis()
         val startedAt = now - backdateMs
         val session = SkillSession(
@@ -102,8 +101,8 @@ class SessionRepository @Inject constructor(
             val alarmAt = if (alarmOffsetMs != null) startedAt + alarmOffsetMs else session.endsAt
             scheduleAlarm(session.sessionId, alarmAt, skillDisplayName)
         }
-        return session
-    }
+        return@withSimulatorBoundary session
+    } }
 
     suspend fun startWorkerSession(
         workerSlot: Int,
@@ -116,7 +115,7 @@ class SessionRepository @Inject constructor(
         levelAtStart: Int = 0,
         weaponSlot: String? = null,
         playerMutexHeld: Boolean = false,
-    ): SkillSession {
+    ): SkillSession { RealitySimulator.withSimulatorBoundary {
         val now = System.currentTimeMillis()
         val session = SkillSession(
             sessionId            = UUID.randomUUID().toString(),
@@ -136,16 +135,15 @@ class SessionRepository @Inject constructor(
         if (playerMutexHeld) playerRepo.stampHeirloomMirrorTargetsUnlocked(session.sessionId, weaponSlot)
         else playerRepo.stampHeirloomMirrorTargets(session.sessionId, weaponSlot)
         scheduleAlarm(session.sessionId, session.endsAt, skillDisplayName)
-        return session
-    }
+        return@withSimulatorBoundary session
+    } }
 
-    suspend fun markCompleted(sessionId: String) {
+    suspend fun markCompleted(sessionId: String) { RealitySimulator.withSimulatorBoundary {
         cancelAlarm(sessionId)
         sessionDao.markCompleted(sessionId)
-    }
+    } }
 
-    /**
-     * Wall-clock moment a boss fight is actually over (boss or player dead), derived
+    /*   * Wall-clock moment a boss fight is actually over (boss or player dead), derived
      * from the pre-simulated frames. endsAt is only the cosmetic full-duration end.
      */
     fun bossFightEndMs(session: SkillSession): Long = try {
@@ -156,39 +154,37 @@ class SessionRepository @Inject constructor(
         if (offset != null) minOf(session.endsAt, session.startedAt + offset) else session.endsAt
     } catch (_: Exception) { session.endsAt }
 
-    /**
-     * Heirloom item keys already rolled inside any stored session's frames (active or
+    /*   * Heirloom item keys already rolled inside any stored session's frames (active or
      * completed-but-uncollected, player or worker). Boss simulations must block these
      * alongside owned heirlooms, otherwise two queued sessions can each roll the same
      * unique before the first is collected (issue #1618).
      */
-    suspend fun pendingHeirloomKeys(): Set<String> {
+    suspend fun pendingHeirloomKeys(): Set<String> { RealitySimulator.withSimulatorBoundary {
         val heirloomKeys = gameData.equipment.filterValues { it.heirloomSkill != null }.keys
-        if (heirloomKeys.isEmpty()) return emptySet()
-        return sessionDao.getAllSessions().flatMapTo(mutableSetOf()) { session ->
+        if (heirloomKeys.isEmpty()) return@withSimulatorBoundary emptySet()
+        return@withSimulatorBoundary sessionDao.getAllSessions().flatMapTo(mutableSetOf()) { session ->
             try {
                 val frames: List<SessionFrame> = json.decodeFromString(session.frames)
                 frames.flatMap { frame -> frame.items.keys.filter { it in heirloomKeys } }
             } catch (_: Exception) { emptyList() }
         }
-    }
+    } }
 
-    /**
-     * True when [session]'s completion time is consistent with its monotonic anchor.
+    /*   * True when [session]'s completion time is consistent with its monotonic anchor.
      * Enforced for ironman characters only — normal characters always pass; anchors are
      * still stamped for everyone so enforcement decisions stay possible later. Fails open
      * when the anchor or boot count is missing, or when the device rebooted since the
      * session started (elapsedRealtime restarts at boot, making the anchor meaningless).
      */
-    suspend fun hasTrustedClock(session: SkillSession): Boolean {
-        val anchor = session.startElapsedMs ?: return true
-        if (!isIronman()) return true
+    suspend fun hasTrustedClock(session: SkillSession): Boolean { RealitySimulator.withSimulatorBoundary {
+        val anchor = session.startElapsedMs ?: return@withSimulatorBoundary true
+        if (!isIronman()) return@withSimulatorBoundary true
         val bootCount = currentBootCount()
-        if (session.startBootCount == null || bootCount == null || bootCount != session.startBootCount) return true
+        if (session.startBootCount == null || bootCount == null || bootCount != session.startBootCount) return@withSimulatorBoundary true
         val elapsedSinceStart = SystemClock.elapsedRealtime() - anchor
-        if (elapsedSinceStart < 0L) return true
-        return System.currentTimeMillis() - session.startedAt <= elapsedSinceStart + CLOCK_SKEW_TOLERANCE_MS
-    }
+        if (elapsedSinceStart < 0L) return@withSimulatorBoundary true
+        return@withSimulatorBoundary System.currentTimeMillis() - session.startedAt <= elapsedSinceStart + CLOCK_SKEW_TOLERANCE_MS
+    } }
 
     private suspend fun isIronman(): Boolean = try {
         playerDao.getPlayer()?.let { json.decodeFromString<PlayerFlags>(it.flags).ironman } ?: false
@@ -200,8 +196,7 @@ class SessionRepository @Inject constructor(
 
     private val watchdogMutex = Mutex()
 
-    /**
-     * In-app watchdog: completes any overdue session (main and workers) without
+    /*   * In-app watchdog: completes any overdue session (main and workers) without
      * depending on AlarmManager delivery, which Doze can defer for hours. Boss
      * sessions end at their simulated death moment; everything else at endsAt.
      * Overdue time is fed to the queue as offline catch-up, same as recovery.
@@ -210,7 +205,7 @@ class SessionRepository @Inject constructor(
     suspend fun completeOverdueSessions(
         starter: QueuedSessionStarter,
         workerStarter: WorkerQueuedSessionStarter? = null,
-    ): Unit = watchdogMutex.withLock {
+    ): Unit = RealitySimulator.withSimulatorBoundary { watchdogMutex.withLock {
         val now = System.currentTimeMillis()
         val session = getActiveSession()
         if (session != null && !session.completed) {
@@ -226,11 +221,11 @@ class SessionRepository @Inject constructor(
                 try { starter.startNextQueued(backdateMs = catchUpMs.coerceAtLeast(0L)) } catch (_: Exception) {}
             }
         } else if (session != null && session.completed) {
-            // The session already finished but the next queued item never started (e.g. the
-            // process died between the alarm's markCompleted and its startNextQueued, which
-            // aggressive battery savers do). Keep retrying every tick, back-dating by the
-            // time lost since the session ended — an unbackdated start here permanently
-            // pushed the queue's schedule late (issue #1739).
+            // session already finished but the next queued item never started (e.g. the
+            //cess died between the alarm's markCompleted and its startNextQueued, which
+            //ressive battery savers do). Keep retrying every tick, back-dating by the
+            //e lost since the session ended — an unbackdated start here permanently
+            //hed the queue's schedule late (issue #1739).
             if (hasTrustedClock(session)) {
                 val endMs = if (session.skillName == "boss") bossFightEndMs(session) else session.endsAt
                 var catchUpMs = maxOf(0L, now - endMs)
@@ -253,32 +248,30 @@ class SessionRepository @Inject constructor(
                 }
             }
         }
-    }
-
-    suspend fun markAllExpiredWorkerSessions() {
+    } }
+    suspend fun markAllExpiredWorkerSessions() { RealitySimulator.withSimulatorBoundary {
         sessionDao.markAllExpiredWorkerSessions(
             System.currentTimeMillis(),
             SystemClock.elapsedRealtime(),
             CLOCK_SKEW_TOLERANCE_MS,
             enforceClock = isIronman(),
-            // -1 never matches a stored boot count, so an unreadable setting fails open.
+            //never matches a stored boot count, so an unreadable setting fails open.
             bootCount = currentBootCount() ?: -1,
         )
-    }
+    } }
 
-    /**
-     * Called on boot or app open to recover from a lost alarm.
+    /*   * Called on boot or app open to recover from a lost alarm.
      * - If the active session has already passed its end time, marks it complete and
      *   advances the queue via [starter].
      * - If it's still running, reschedules the alarm so it fires at the correct time.
      */
-    suspend fun recoverActiveSession(starter: QueuedSessionStarter) {
+    suspend fun recoverActiveSession(starter: QueuedSessionStarter) { RealitySimulator.withSimulatorBoundary {
         val session = try { getActiveSession() } catch (_: Exception) { null } ?: run {
             starter.startNextQueued()
-            return
+            return@withSimulatorBoundary
         }
         if (session.completed) {
-            if (!hasTrustedClock(session)) return
+            if (!hasTrustedClock(session)) return@withSimulatorBoundary
             val endMs = if (session.skillName == "boss") bossFightEndMs(session) else session.endsAt
             var catchUpMs = maxOf(0L, System.currentTimeMillis() - endMs)
             while (catchUpMs > 0) {
@@ -287,18 +280,18 @@ class SessionRepository @Inject constructor(
                 catchUpMs -= used
             }
             try { starter.startNextQueued(backdateMs = catchUpMs) } catch (_: Exception) { markCompleted(session.sessionId) }
-            return
+            return@withSimulatorBoundary
         }
-        // Boss sessions: endsAt is cosmetic (full duration). The session really ends
-        // at bossFightEndMs — complete or re-arm the alarm based on that moment,
-        // never on endsAt.
+        //s sessions: endsAt is cosmetic (full duration). The session really ends
+        //bossFightEndMs — complete or re-arm the alarm based on that moment,
+        //er on endsAt.
         if (session.skillName == "boss") {
             val fightEndMs = bossFightEndMs(session)
             if (System.currentTimeMillis() >= fightEndMs && hasTrustedClock(session)) {
                 markCompleted(session.sessionId)
-                // Fast-forward the offline window like the generic path below, or a repeat
-                // chain (x100 boss runs) advances only one fight per app launch when the OS
-                // suppresses alarms for a killed app (Discord report, Aug 2026).
+                //t-forward the offline window like the generic path below, or a repeat
+                //in (x100 boss runs) advances only one fight per app launch when the OS
+                //presses alarms for a killed app (Discord report, Aug 2026).
                 var catchUpMs = System.currentTimeMillis() - fightEndMs
                 while (catchUpMs > 0) {
                     val used = try { starter.insertNextQueuedAsOffline(catchUpMs) } catch (_: Exception) { 0L }
@@ -309,7 +302,7 @@ class SessionRepository @Inject constructor(
             } else {
                 scheduleAlarm(session.sessionId, fightEndMs, session.skillName)
             }
-            return
+            return@withSimulatorBoundary
         }
         val now = System.currentTimeMillis()
         try {
@@ -328,16 +321,16 @@ class SessionRepository @Inject constructor(
         } catch (_: Exception) {
             if (hasTrustedClock(session)) markCompleted(session.sessionId)
         }
-    }
+    } }
 
-    suspend fun recoverActiveWorkerSession(slot: Int, workerStarter: WorkerQueuedSessionStarter) {
+    suspend fun recoverActiveWorkerSession(slot: Int, workerStarter: WorkerQueuedSessionStarter) { RealitySimulator.withSimulatorBoundary {
         val session = try { getActiveWorkerSession(slot) } catch (_: Exception) { null } ?: run {
             workerStarter.startNextQueued(slot)
-            return
+            return@withSimulatorBoundary
         }
         if (session.completed) {
             workerStarter.startNextQueued(slot)
-            return
+            return@withSimulatorBoundary
         }
         val now = System.currentTimeMillis()
         try {
@@ -350,46 +343,40 @@ class SessionRepository @Inject constructor(
         } catch (_: Exception) {
             if (hasTrustedClock(session)) markCompleted(session.sessionId)
         }
-    }
+    } }
 
-    suspend fun getSession(sessionId: String): SkillSession? = sessionDao.getSession(sessionId)
-
-    /** Every stored session: active and completed, player and both worker slots. */
-    suspend fun getAllSessions(): List<SkillSession> = sessionDao.getAllSessions()
-
-    suspend fun abandonSession(sessionId: String) {
+    suspend fun getSession(sessionId: String): SkillSession? = RealitySimulator.withSimulatorBoundary { sessionDao.getSession(sessionId) }
+    /*ery stored session: active and completed, player and both worker slots. */
+    suspend fun getAllSessions(): List<SkillSession> = RealitySimulator.withSimulatorBoundary { sessionDao.getAllSessions() }
+    suspend fun abandonSession(sessionId: String) { RealitySimulator.withSimulatorBoundary {
         cancelAlarm(sessionId)
         sessionDao.delete(sessionId)
         pruneMirrorStamps()
-    }
+    } }
 
-    /** Delete a completed session after rewards have been applied. */
-    suspend fun deleteSession(sessionId: String) {
+    /*lete a completed session after rewards have been applied. */
+    suspend fun deleteSession(sessionId: String) { RealitySimulator.withSimulatorBoundary {
         cancelAlarm(sessionId)
         sessionDao.delete(sessionId)
         pruneMirrorStamps()
-    }
+    } }
 
-    suspend fun deleteAllSessions() {
+    suspend fun deleteAllSessions() { RealitySimulator.withSimulatorBoundary {
         sessionDao.deleteAll()
         pruneMirrorStamps()
-    }
+    } }
 
     private suspend fun pruneMirrorStamps() =
         playerRepo.pruneHeirloomMirrorTargets(sessionDao.getAllSessions().mapTo(mutableSetOf()) { it.sessionId })
 
-    suspend fun insertSession(session: SkillSession) = sessionDao.insert(session)
-
+    suspend fun insertSession(session: SkillSession) = RealitySimulator.withSimulatorBoundary { sessionDao.insert(session) }
     suspend fun getRecentCompleted(limit: Int = 20): List<SkillSession> =
-        sessionDao.getRecentCompleted(limit)
-
+        RealitySimulator.withSimulatorBoundary { sessionDao.getRecentCompleted(limit) }
     suspend fun getAllCompletedSessions(): List<SkillSession> =
-        sessionDao.getAllCompletedSessions()
-
+        RealitySimulator.withSimulatorBoundary { sessionDao.getAllCompletedSessions() }
     suspend fun getOldestCompletedSession(): SkillSession? =
-        sessionDao.getOldestCompletedSession()
-
-    // ------------------------------------------------------------------
+        RealitySimulator.withSimulatorBoundary { sessionDao.getOldestCompletedSession() }
+    //---------------------------------------------------------------
 
     private fun alarmIntent(sessionId: String, skillDisplayName: String): PendingIntent {
         val intent = Intent(context, SessionAlarmReceiver::class.java).apply {
@@ -414,11 +401,13 @@ class SessionRepository @Inject constructor(
         )
     }
 
-    private fun scheduleAlarm(sessionId: String, endsAt: Long, skillDisplayName: String) {
-        // Sessions started inside a Simulator run live only in the isolated session table, so
-        // arming a real alarm for one would fire against a session Base Reality never had. The
-        // in-app watchdog and Time Skip complete isolated sessions instead.
-        if (RealitySimulator.isSimulationActive) return
+    private suspend fun scheduleAlarm(sessionId: String, endsAt: Long, skillDisplayName: String) {
+        //sions started inside a Simulator run live only in the isolated session table, so
+        //ing a real alarm for one would fire against a session Base Reality never had.
+        // check is PINNED-LAYER aware: if the enclosing withSimulatorBoundary started in
+        // sim (even if isSimulationActive has since been flipped false by death), we must
+        // schedule a real alarm for the simulated session.
+        if (RealitySimulator.effectiveActive()) return
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val pi = alarmIntent(sessionId, skillDisplayName)
         try {
@@ -428,12 +417,13 @@ class SessionRepository @Inject constructor(
         }
     }
 
-    internal fun cancelAlarm(sessionId: String) {
-        // An isolated session can share a real session's id (the run starts from a copy of the
-        // table), so completing/abandoning/deleting it inside a simulation must not cancel Base
-        // Reality's alarm: that real session still needs it, and cancelling it would defer its
-        // completion to the watchdog.
-        if (RealitySimulator.isSimulationActive) return
+    internal suspend fun cancelAlarm(sessionId: String) {
+        //isolated session can share a real session's id (the run starts from a copy of the
+        //le), so completing/abandoning/deleting it inside a simulation must not cancel Base
+        //lity's alarm: that real session still needs it, and cancelling it would defer its
+        //pletion to the watchdog.  Pinned-layer aware so a death mid-startSession doesn't
+        //se the cancel to fire against the real alarm manager either.
+        if (RealitySimulator.effectiveActive()) return
         try {
             val am      = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
             val pending = cancelIntent(sessionId)
@@ -443,7 +433,7 @@ class SessionRepository @Inject constructor(
     }
 
     companion object {
-        const val SESSION_DURATION_MS = 60L * 60L * 1_000L  // 1 hour
+        const val SESSION_DURATION_MS = 60L * 60L * 1_000L  //our
         const val CLOCK_SKEW_TOLERANCE_MS = 120_000L
     }
 }

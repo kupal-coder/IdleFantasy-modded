@@ -204,10 +204,10 @@ class SimulatorViewModel @Inject constructor(
     fun skipRewards() {
         viewModelScope.launch {
             try {
-                val claimed = RealitySimulator.claimRewards(playerRepo, emptyList(), activeSlot())
+                RealitySimulator.skipRewards(playerRepo)
                 _extra.update {
                     it.copy(selectedRewards = emptySet(), rewardPool = emptyList(),
-                        message = if (claimed) context.withAppLocale().getString(R.string.simulator_return_message) else null)
+                        message = context.withAppLocale().getString(R.string.simulator_return_message))
                 }
             } catch (e: Exception) {
                 abortWithCrashMessage()
