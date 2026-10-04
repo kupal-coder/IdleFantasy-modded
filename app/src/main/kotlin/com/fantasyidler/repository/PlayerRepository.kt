@@ -11,6 +11,7 @@ import com.fantasyidler.data.model.*
 import com.fantasyidler.simulator.HeirloomStats
 import com.fantasyidler.simulator.PrestigeBoosts
 import com.fantasyidler.simulator.PrestigePoints
+import com.fantasyidler.simulator.RealitySimulator
 import com.fantasyidler.simulator.SkillSimulator
 import com.fantasyidler.simulator.XpTable
 import com.fantasyidler.ui.viewmodel.combatLevelFrom
@@ -27,10 +28,10 @@ import java.util.Calendar
 import javax.inject.Inject
 import javax.inject.Singleton
 
-// ---------------------------------------------------------------------------
-// Helpers — use explicit two-arg encodeToString(serializer, value) to avoid
-// Kotlin 2.0 extension/member resolution ambiguity with the single-arg form.
-// ---------------------------------------------------------------------------
+//------------------------------------------------------------------------
+//pers — use explicit two-arg encodeToString(serializer, value) to avoid
+//lin 2.0 extension/member resolution ambiguity with the single-arg form.
+//------------------------------------------------------------------------
 
 private inline fun <reified T> Json.encode(value: T): String =
     encodeToString(serializersModule.serializer<T>(), value)
@@ -62,8 +63,7 @@ class PlayerRepository @Inject constructor(
 ) {
     val playerMutex = Mutex()
 
-    /**
-     * Emits the raw [Player] entity whenever the DB row changes.
+    /*   * Emits the raw [Player] entity whenever the DB row changes.
      * Creates the default player on first access so observers never stall on null.
      */
     val playerFlow: Flow<Player?> = flow {
@@ -71,8 +71,15 @@ class PlayerRepository @Inject constructor(
         emitAll(playerDao.observePlayer())
     }
 
-    /** Returns the player, creating a default profile if none exists. */
-    suspend fun getOrCreatePlayer(): Player {
+    /*turns the player, creating a default profile if none exists. */
+    suspend fun getOrCreatePlayer(): Player = RealitySimulator.withSimulatorBoundary {
+        getOrCreatePlayerUnlocked()
+    }
+
+    /*ck-free / boundary-free version: reads/writes the player DAO directly. Used by
+     *  RealitySimulator when it already holds simulatorMutex and playerMutex to avoid
+     *  double-locking (Mutex is not reentrant). */
+    internal suspend fun getOrCreatePlayerUnlocked(): Player {
         val player = playerDao.getPlayer() ?: createDefaultPlayer().also { playerDao.upsert(it) }
         return if (player.skillXp.contains("\"hp\":")) migrateHpKey(player) else player
     }
@@ -117,12 +124,11 @@ class PlayerRepository @Inject constructor(
     suspend fun getOwnedPets(): List<OwnedPet> =
         json.decodeFromString(getOrCreatePlayer().pets)
 
-    // ------------------------------------------------------------------
-    // Write operations
-    // ------------------------------------------------------------------
+    //---------------------------------------------------------------
+    //te operations
+    //---------------------------------------------------------------
 
-    /**
-     * Apply completed session results to the player: add XP (doubled if boost active),
+    /*   * Apply completed session results to the player: add XP (doubled if boost active),
      * recalculate level, and merge loot into inventory.
      * Returns the keys of any skill capes awarded (level 99 reached for the first time).
      */
@@ -134,8 +140,7 @@ class PlayerRepository @Inject constructor(
             gameData,
         )
 
-    /**
-     * Mirrors awarded skill XP into the equipped heirloom whose governing skill matches.
+    /*   * Mirrors awarded skill XP into the equipped heirloom whose governing skill matches.
      * Item XP is capped at the level-99 threshold and is never reset by prestige.
      */
     private fun mirrorHeirloomXp(
@@ -161,16 +166,15 @@ class PlayerRepository @Inject constructor(
         return updated?.let { flags.copy(heirloomXp = it) } ?: flags
     }
 
-    /**
-     * Records which equipped heirlooms may mirror XP from session [sessionId], captured at start
+    /*   * Records which equipped heirlooms may mirror XP from session [sessionId], captured at start
      * so swapping gear before collection can't redirect the XP (issue #1632). Weapon-skill
      * entries are kept only for the style actually fighting ([weaponSlot]).
      */
-    suspend fun stampHeirloomMirrorTargets(sessionId: String, weaponSlot: String?) = playerMutex.withLock {
+    suspend fun stampHeirloomMirrorTargets(sessionId: String, weaponSlot: String?) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         stampHeirloomMirrorTargetsUnlocked(sessionId, weaponSlot)
-    }
+    }}
 
-    /** Lock-free variant for callers already inside [playerMutex] (the queue starters);
+    /*ck-free variant for callers already inside [playerMutex] (the queue starters);
      * playerMutex is not reentrant, so calling the locked version there deadlocks (1.14.5). */
     internal suspend fun stampHeirloomMirrorTargetsUnlocked(sessionId: String, weaponSlot: String?) {
         val player = getOrCreatePlayer()
@@ -187,13 +191,13 @@ class PlayerRepository @Inject constructor(
         updateFlagsUnlocked(flags.copy(heirloomMirrorTargets = flags.heirloomMirrorTargets + (sessionId to targets)))
     }
 
-    /** Drops mirror-target stamps for sessions that no longer exist. */
+    /*ops mirror-target stamps for sessions that no longer exist. */
     suspend fun pruneHeirloomMirrorTargets(validSessionIds: Set<String>) =
         updateFlagsAtomically { flags ->
             flags.copy(heirloomMirrorTargets = flags.heirloomMirrorTargets.filterKeys { it in validSessionIds })
         }
 
-    /** Adds loot to the inventory; heirlooms are unique and never stack past one. */
+    /*ds loot to the inventory; heirlooms are unique and never stack past one. */
     private fun grantItems(inventory: MutableMap<String, Int>, items: Map<String, Int>) {
         for ((item, qty) in items) {
             inventory[item] = if (gameData.equipment[item]?.heirloomSkill != null) 1
@@ -208,16 +212,16 @@ class PlayerRepository @Inject constructor(
         efficiencyMultiplier: Float = 1.0f,
         sessionId: String? = null,
         applyXpBoosts: Boolean = true,
-    ): List<String> = playerMutex.withLock {
+    ): List<String> = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player    = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
-        // Sigil stones apply game-wide, so mainland collects pick up the same xp/loot mults
-        // an isle collect would. Coin stones fold in at the coin write below.
+        //il stones apply game-wide, so mainland collects pick up the same xp/loot mults
+        //isle collect would. Coin stones fold in at the coin write below.
         val sigils = sigilBonusesFrom(flags)
         val scaledXp = if (efficiencyMultiplier == 1.0f) xpGained else (xpGained * efficiencyMultiplier).toLong()
-        // 2x boost, blessing, and prestige xp nodes combined in one place (ironman-inert).
-        // applyXpBoosts=false grants raw XP with no heirloom mirror, for grants that must be
-        // exactly reversible by deductSkillXp (crop planting XP, issue #1645).
+        //boost, blessing, and prestige xp nodes combined in one place (ironman-inert).
+        //lyXpBoosts=false grants raw XP with no heirloom mirror, for grants that must be
+        //ctly reversible by deductSkillXp (crop planting XP, issue #1645).
         val boostedXp = if (applyXpBoosts) (scaledXp * boostRepo.xpMultiplier(skillName, flags, prayerCapeMult(player, flags)) * sigils.xpMult).toLong()
                         else scaledXp
         val efficiencyItems = if (efficiencyMultiplier == 1.0f) itemsGained
@@ -260,11 +264,10 @@ class PlayerRepository @Inject constructor(
                 flags       = json.encode<PlayerFlags>(newFlags.plusSeen(scaledItems.keys + awardedCapes)),
             )
         )
-        return awardedCapes
-    }
+        return@withSimulatorBoundary awardedCapes
+    }}
 
-    /**
-     * Elder-XP level scaling — action XP scales with the current elder skill level so the
+    /*   * Elder-XP level scaling — action XP scales with the current elder skill level so the
      * grind never plateaus even with a small activity pool. +5% XP per elder level (level
      * 1 = 1x, level 30 = 2.45x, level 60 = 3.95x, level 99 = ~5.9x). Applied on top of the
      * activity's base XP at collection time.
@@ -272,8 +275,7 @@ class PlayerRepository @Inject constructor(
     private fun elderXpMultiplier(elderLevel: Int): Double =
         1.0 + (elderLevel.coerceAtLeast(1) - 1) * 0.05
 
-    /**
-     * Bonuses aggregated from Sigil Stones embedded across all Elder pieces. Each stone
+    /*   * Bonuses aggregated from Sigil Stones embedded across all Elder pieces. Each stone
      * of a colour contributes its full bonus; equipping multiple of the same colour stacks
      * linearly. Applied on top of elder-XP level scaling at collection time.
      */
@@ -282,9 +284,9 @@ class PlayerRepository @Inject constructor(
         val coinMult: Double,
         val lootMult: Double,
         val essenceMult: Double,
-        /** Topaz stack — scales `ancient_sigil` drops specifically. */
+        /*paz stack — scales `ancient_sigil` drops specifically. */
         val sigilMult: Double,
-        /** Diamond stack — scales `elder_bone` drops specifically. */
+        /*amond stack — scales `elder_bone` drops specifically. */
         val boneMult: Double,
     )
     private fun sigilBonusesFrom(flags: PlayerFlags): SigilBonuses {
@@ -299,8 +301,7 @@ class PlayerRepository @Inject constructor(
         )
     }
 
-    /**
-     * Applies per-item sigil multipliers at collection time. Specific items get their targeted
+    /*   * Applies per-item sigil multipliers at collection time. Specific items get their targeted
      * stone's multiplier (essence→amethyst, sigils→topaz, elder bones→diamond); everything else
      * gets the general loot mult (emerald). Rounding never drops a stack below its base count.
      */
@@ -318,8 +319,7 @@ class PlayerRepository @Inject constructor(
         }
     }
 
-    /**
-     * Elder Isle multi-skill collection (combat sessions where XP splits across attack/str/def/hp).
+    /*   * Elder Isle multi-skill collection (combat sessions where XP splits across attack/str/def/hp).
      * Routes each skill's XP into PlayerFlags.elderSkillXp; items into shared inventory. No cape
      * awards, no XP boosts, no heirloom mirror — isle is walled off from mainland bonuses.
      */
@@ -327,7 +327,7 @@ class PlayerRepository @Inject constructor(
         xpPerSkill: Map<String, Long>,
         itemsGained: Map<String, Int>,
         coinsGained: Long,
-    ) = playerMutex.withLock {
+    ) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player    = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
@@ -356,10 +356,9 @@ class PlayerRepository @Inject constructor(
                 ).plusSeen(boostedItems.keys)),
             )
         )
-    }
+    }}
 
-    /**
-     * Elder Isle session collection: routes XP into PlayerFlags.elderSkillXp (separate pool
+    /*   * Elder Isle session collection: routes XP into PlayerFlags.elderSkillXp (separate pool
      * from mainland skill_xp) and adds items to the shared inventory. No cape awards, no
      * XP boosts, no heirloom mirroring — the isle is walled off from mainland bonuses.
      */
@@ -367,7 +366,7 @@ class PlayerRepository @Inject constructor(
         skillName: String,
         xpGained: Long,
         itemsGained: Map<String, Int>,
-    ) = playerMutex.withLock {
+    ) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player    = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
@@ -393,10 +392,10 @@ class PlayerRepository @Inject constructor(
                 ).plusSeen(itemsGained.keys)),
             )
         )
-    }
+    }}
 
-    /** Subtract XP from a skill, flooring at 0. Recalculates level. */
-    suspend fun deductSkillXp(skillName: String, amount: Long) = playerMutex.withLock {
+    /*btract XP from a skill, flooring at 0. Recalculates level. */
+    suspend fun deductSkillXp(skillName: String, amount: Long) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val levels: MutableMap<String, Int> = json.decodeFromString(player.skillLevels)
         val xpMap:  MutableMap<String, Long> = json.decodeFromString(player.skillXp)
@@ -407,11 +406,11 @@ class PlayerRepository @Inject constructor(
             skillLevels = json.encode<Map<String, Int>>(levels),
             skillXp     = json.encode<Map<String, Long>>(xpMap),
         ))
-    }
+    }}
 
-    /** Add XP to a skill with no boosts or multipliers. Recalculates level. */
-    suspend fun debugAddSkillXp(skillName: String, amount: Long) = playerMutex.withLock {
-        if (amount <= 0L) return
+    /*d XP to a skill with no boosts or multipliers. Recalculates level. */
+    suspend fun debugAddSkillXp(skillName: String, amount: Long) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
+        if (amount <= 0L) return@withSimulatorBoundary
         val player = getOrCreatePlayer()
         val levels: MutableMap<String, Int> = json.decodeFromString(player.skillLevels)
         val xpMap: MutableMap<String, Long> = json.decodeFromString(player.skillXp)
@@ -422,21 +421,20 @@ class PlayerRepository @Inject constructor(
             skillLevels = json.encode<Map<String, Int>>(levels),
             skillXp     = json.encode<Map<String, Long>>(xpMap),
         ))
-    }
+    }}
 
     data class BuryBonesResult(val buried: Int, val xpGained: Long, val awardedCape: String?)
 
-    /**
-     * Atomically consume up to [count] of [boneKey] from inventory and award [xpToAward]
+    /*   * Atomically consume up to [count] of [boneKey] from inventory and award [xpToAward]
      * prayer XP (scaled down proportionally if fewer bones were available). One DB write
      * regardless of [count] — the Bone Altar accumulates rapid taps into batches.
      */
-    suspend fun buryBonesAtomic(boneKey: String, count: Int, xpToAward: Long): BuryBonesResult = playerMutex.withLock {
+    suspend fun buryBonesAtomic(boneKey: String, count: Int, xpToAward: Long): BuryBonesResult = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player    = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
         val available = inventory[boneKey] ?: 0
         val buried    = minOf(count, available)
-        if (buried <= 0) return BuryBonesResult(0, 0L, null)
+        if (buried <= 0) return@withSimulatorBoundary BuryBonesResult(0, 0L, null)
         val xpGained  = if (buried == count) xpToAward else xpToAward * buried / count
 
         val newQty = available - buried
@@ -463,14 +461,13 @@ class PlayerRepository @Inject constructor(
             skillLevels = json.encode<Map<String, Int>>(levels),
             skillXp     = json.encode<Map<String, Long>>(xpMap),
         ))
-        return BuryBonesResult(buried, xpGained, awardedCape)
-    }
+        return@withSimulatorBoundary BuryBonesResult(buried, xpGained, awardedCape)
+    }}
 
-    /**
-     * Remove items from the player's inventory.
+    /*   * Remove items from the player's inventory.
      * Returns false (and makes no change) if any item is in insufficient quantity.
      */
-    suspend fun consumeItems(items: Map<String, Int>): Boolean = playerMutex.withLock { consumeItemsUnlocked(items) }
+    suspend fun consumeItems(items: Map<String, Int>): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { consumeItemsUnlocked(items) }}
 
     internal suspend fun consumeItemsUnlocked(items: Map<String, Int>): Boolean {
         val player = getOrCreatePlayer()
@@ -488,12 +485,11 @@ class PlayerRepository @Inject constructor(
         return true
     }
 
-    /**
-     * Opens up to [count] held Ancient Treasures: each pays [TREASURE_COIN_MIN]..[TREASURE_COIN_MAX]
+    /*   * Opens up to [count] held Ancient Treasures: each pays [TREASURE_COIN_MIN]..[TREASURE_COIN_MAX]
      * coins with a [TREASURE_GEM_CHANCE] chance of a random gem. Returns (opened, coins, gems),
      * or null when none are held.
      */
-    suspend fun openAncientTreasures(count: Int): Triple<Int, Long, Map<String, Int>>? = playerMutex.withLock {
+    suspend fun openAncientTreasures(count: Int): Triple<Int, Long, Map<String, Int>>? = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
         val opened = minOf(count, inventory[ANCIENT_TREASURE_KEY] ?: 0)
@@ -508,10 +504,10 @@ class PlayerRepository @Inject constructor(
                 gems[gem] = (gems[gem] ?: 0) + 1
             }
         }
-        // One player read + one JSON encode + one DB write — the previous split into
-        // consumeItemsUnlocked / addCoinsUnlocked / addItemsUnlocked forced 3 sequential
-        // Room writes and a full PlayerFlags re-encode per open, which stacked to seconds
-        // when opening 1k+ treasures at once on an endgame save (#1852).
+        // player read + one JSON encode + one DB write — the previous split into
+        //sumeItemsUnlocked / addCoinsUnlocked / addItemsUnlocked forced 3 sequential
+        //m writes and a full PlayerFlags re-encode per open, which stacked to seconds
+        //n opening 1k+ treasures at once on an endgame save (#1852).
         val newTreasureQty = (inventory[ANCIENT_TREASURE_KEY] ?: 0) - opened
         if (newTreasureQty <= 0) inventory.remove(ANCIENT_TREASURE_KEY) else inventory[ANCIENT_TREASURE_KEY] = newTreasureQty
         for ((gem, qty) in gems) {
@@ -523,9 +519,9 @@ class PlayerRepository @Inject constructor(
             coins     = newCoins,
         ))
         Triple(opened, coins, gems)
-    }
+    }}
 
-    suspend fun addCoins(amount: Long) = playerMutex.withLock { addCoinsUnlocked(amount) }
+    suspend fun addCoins(amount: Long) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { addCoinsUnlocked(amount) }}
 
     internal suspend fun addCoinsUnlocked(amount: Long) {
         require(amount >= 0) { "Cannot add negative coins" }
@@ -534,8 +530,8 @@ class PlayerRepository @Inject constructor(
         playerDao.upsert(player.copy(coins = newCoins))
     }
 
-    /** Awards capes for any skill already at 99 that doesn't have one yet (retroactive fix). */
-    suspend fun awardMissingCapes() = playerMutex.withLock { awardMissingCapesUnlocked() }
+    /*ards capes for any skill already at 99 that doesn't have one yet (retroactive fix). */
+    suspend fun awardMissingCapes() = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { awardMissingCapesUnlocked() }}
 
     private suspend fun awardMissingCapesUnlocked() {
         val player    = getOrCreatePlayer()
@@ -554,8 +550,8 @@ class PlayerRepository @Inject constructor(
         if (changed) playerDao.upsert(player.copy(inventory = json.encode<Map<String, Int>>(inventory)))
     }
 
-    /** Adds qty of item to the player's inventory at no coin cost (prize/drop grant). */
-    suspend fun grantItem(key: String, qty: Int = 1) = playerMutex.withLock { grantItemUnlocked(key, qty) }
+    /*ds qty of item to the player's inventory at no coin cost (prize/drop grant). */
+    suspend fun grantItem(key: String, qty: Int = 1) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { grantItemUnlocked(key, qty) }}
 
     private suspend fun grantItemUnlocked(key: String, qty: Int = 1) {
         require(qty >= 0) { "Cannot grant negative quantity" }
@@ -569,8 +565,8 @@ class PlayerRepository @Inject constructor(
         ))
     }
 
-    /** Returns false if the player has insufficient coins. */
-    suspend fun spendCoins(amount: Long): Boolean = playerMutex.withLock { spendCoinsUnlocked(amount) }
+    /*turns false if the player has insufficient coins. */
+    suspend fun spendCoins(amount: Long): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { spendCoinsUnlocked(amount) }}
 
     internal suspend fun spendCoinsUnlocked(amount: Long): Boolean {
         require(amount >= 0) { "Cannot spend negative coins" }
@@ -580,53 +576,52 @@ class PlayerRepository @Inject constructor(
         return true
     }
 
-    /**
-     * Rolls the daily boss coin soft cap for one victorious kill: the first
+    /*   * Rolls the daily boss coin soft cap for one victorious kill: the first
      * [BOSS_FULL_COIN_KILLS_PER_DAY] kills of each boss each day pay full coins, later ones pay
      * [BOSS_COIN_SOFT_CAP_MULT]. Increments that boss's counter and returns this kill's multiplier.
      */
-    suspend fun rollBossCoinSoftCap(bossKey: String): Double = playerMutex.withLock {
+    suspend fun rollBossCoinSoftCap(bossKey: String): Double = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlagsUnlocked()
         val today = gameDay(flags.dailyResetHour)
         val counts = if (flags.bossCoinDay == today) flags.bossCoinKillsByBoss else emptyMap()
         val count = counts[bossKey] ?: 0
         updateFlagsUnlocked(flags.copy(bossCoinDay = today, bossCoinKillsByBoss = counts + (bossKey to count + 1)))
         if (count < BOSS_FULL_COIN_KILLS_PER_DAY) 1.0 else BOSS_COIN_SOFT_CAP_MULT
-    }
+    }}
 
-    /** Toggles [itemKey]'s sell-lock. Returns true if the item is now locked. */
-    suspend fun toggleItemLock(itemKey: String): Boolean = playerMutex.withLock {
+    /*ggles [itemKey]'s sell-lock. Returns true if the item is now locked. */
+    suspend fun toggleItemLock(itemKey: String): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlagsUnlocked()
         val wasLocked = itemKey in flags.lockedItems
         updateFlagsUnlocked(flags.copy(
             lockedItems = if (wasLocked) flags.lockedItems - itemKey else flags.lockedItems + itemKey,
         ))
         !wasLocked
-    }
+    }}
 
-    /** Full-coin kills still available today for [bossKey], for display. */
+    /*ll-coin kills still available today for [bossKey], for display. */
     fun bossFullCoinKillsLeft(flags: PlayerFlags, bossKey: String): Int {
         val today = gameDay(flags.dailyResetHour)
         val count = if (flags.bossCoinDay == today) flags.bossCoinKillsByBoss[bossKey] ?: 0 else 0
         return (BOSS_FULL_COIN_KILLS_PER_DAY - count).coerceAtLeast(0)
     }
 
-    /** yyyymmdd stamp of the current game day, rolling over at [resetHour] rather than midnight. */
+    /*yymmdd stamp of the current game day, rolling over at [resetHour] rather than midnight. */
     fun gameDay(resetHour: Int): Int = Calendar.getInstance().let {
         if (it.get(Calendar.HOUR_OF_DAY) < resetHour) it.add(Calendar.DAY_OF_YEAR, -1)
         it.get(Calendar.YEAR) * 10000 + it.get(Calendar.MONTH) * 100 + it.get(Calendar.DAY_OF_MONTH)
     }
 
-    suspend fun updateFlags(flags: PlayerFlags) = playerMutex.withLock { updateFlagsUnlocked(flags) }
+    suspend fun updateFlags(flags: PlayerFlags) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { updateFlagsUnlocked(flags) }}
 
-    suspend fun updateFlagsAtomically(block: (PlayerFlags) -> PlayerFlags) = playerMutex.withLock {
+    suspend fun updateFlagsAtomically(block: (PlayerFlags) -> PlayerFlags) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val current = getFlagsUnlocked()
         val updated = block(current)
         if (updated != current) updateFlagsUnlocked(updated)
-    }
+    }}
 
-    /** Stops an in-progress boss repeat run (e.g. on abandon) so it doesn't leave stale "N/M" progress behind. */
-    suspend fun clearActiveBossRepeat() = playerMutex.withLock { clearActiveBossRepeatUnlocked() }
+    /*ops an in-progress boss repeat run (e.g. on abandon) so it doesn't leave stale "N/M" progress behind. */
+    suspend fun clearActiveBossRepeat() = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { clearActiveBossRepeatUnlocked() }}
 
     internal suspend fun clearActiveBossRepeatUnlocked() {
         val flags = getFlagsUnlocked()
@@ -635,8 +630,8 @@ class PlayerRepository @Inject constructor(
         }
     }
 
-    /** Stops an in-progress dungeon repeat run (e.g. on abandon) so it doesn't leave stale "N/M" progress behind. */
-    suspend fun clearActiveDungeonRepeat() = playerMutex.withLock { clearActiveDungeonRepeatUnlocked() }
+    /*ops an in-progress dungeon repeat run (e.g. on abandon) so it doesn't leave stale "N/M" progress behind. */
+    suspend fun clearActiveDungeonRepeat() = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { clearActiveDungeonRepeatUnlocked() }}
 
     internal suspend fun clearActiveDungeonRepeatUnlocked() {
         val flags = getFlagsUnlocked()
@@ -645,7 +640,7 @@ class PlayerRepository @Inject constructor(
         }
     }
 
-    /** Called after a dungeon [QueuedAction] is freshly dequeued and started, to (re)initialise repeat progress. */
+    /*lled after a dungeon [QueuedAction] is freshly dequeued and started, to (re)initialise repeat progress. */
     internal suspend fun stampDungeonRepeatStartUnlocked(action: QueuedAction) {
         if (action.repeatCount > 1) {
             updateFlagsUnlocked(getFlagsUnlocked().copy(
@@ -658,7 +653,7 @@ class PlayerRepository @Inject constructor(
         }
     }
 
-    /** Called after a boss [QueuedAction] is freshly dequeued and started, to (re)initialise repeat progress. */
+    /*lled after a boss [QueuedAction] is freshly dequeued and started, to (re)initialise repeat progress. */
     internal suspend fun stampBossRepeatStartUnlocked(action: QueuedAction) {
         if (action.repeatCount > 1) {
             updateFlagsUnlocked(getFlagsUnlocked().copy(
@@ -671,11 +666,11 @@ class PlayerRepository @Inject constructor(
         }
     }
 
-    suspend fun <T> withLock(block: suspend () -> T): T = playerMutex.withLock { block() }
+    suspend fun <T> withLock(block: suspend () -> T): T = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { block() } }
 
     internal suspend fun updateFlagsUnlocked(flags: PlayerFlags) {
-        // Single-column update: replacing the whole row rewrote every JSON blob and made
-        // frequent flag writes (queue reorders especially) visibly laggy (issue #1764).
+        //gle-column update: replacing the whole row rewrote every JSON blob and made
+        //quent flag writes (queue reorders especially) visibly laggy (issue #1764).
         val encoded = json.encode<PlayerFlags>(flags)
         if (playerDao.updateFlags(encoded) == 0) {
             playerDao.upsert(getOrCreatePlayer().copy(flags = encoded))
@@ -684,7 +679,7 @@ class PlayerRepository @Inject constructor(
 
     suspend fun getQueue(): List<QueuedAction> = getFlags().sessionQueue
 
-    /** Base queue size (3) plus any Queue Master town building bonus, plus the Monument's
+    /*se queue size (3) plus any Queue Master town building bonus, plus the Monument's
      *  Gilded stage. Elder Isle caps at the base 3 — none of those mainland slot boosts
      *  reach isle sessions, per the isle bonus-flow rule. */
     fun maxQueueSize(flags: PlayerFlags): Int {
@@ -698,15 +693,15 @@ class PlayerRepository @Inject constructor(
         return 3 + extraSlots
     }
 
-    /** Appends an action to the queue. Returns false (no change) if the queue is already full. */
-    suspend fun enqueueAction(action: QueuedAction): Boolean = playerMutex.withLock { enqueueActionUnlocked(action) }
+    /*pends an action to the queue. Returns false (no change) if the queue is already full. */
+    suspend fun enqueueAction(action: QueuedAction): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { enqueueActionUnlocked(action) }}
 
     private suspend fun enqueueActionUnlocked(action: QueuedAction): Boolean {
         val flags = getFlags()
         if (flags.sessionQueue.size >= maxQueueSize(flags)) return false
-        // Stamp the isle flag at enqueue time so an action queued on isle stays "elder"
-        // even if the player sails back before it starts. QueuedSessionStarter reads
-        // action.isElderSession instead of the live flags value.
+        //mp the isle flag at enqueue time so an action queued on isle stays "elder"
+        //n if the player sails back before it starts. QueuedSessionStarter reads
+        //ion.isElderSession instead of the live flags value.
         val stamped = action.copy(
             levelAtQueue   = queueLevelFor(action),
             isElderSession = flags.onElderIsle,
@@ -715,8 +710,7 @@ class PlayerRepository @Inject constructor(
         return true
     }
 
-    /**
-     * Relevant level for a queued action's prestige-void floor. Mirrors the levelAtStart
+    /*   * Relevant level for a queued action's prestige-void floor. Mirrors the levelAtStart
      * mapping in the queue starters so a prestige between queueing and collection is caught.
      */
     private suspend fun queueLevelFor(action: QueuedAction): Int {
@@ -728,8 +722,8 @@ class PlayerRepository @Inject constructor(
         }
     }
 
-    /** Creates and enqueues a combat (dungeon) session for a Slayer task's auto-advance. Returns false if queue is full. */
-    suspend fun enqueueCombatSession(dungeonKey: String, dungeonDisplayName: String): Boolean = playerMutex.withLock {
+    /*eates and enqueues a combat (dungeon) session for a Slayer task's auto-advance. Returns false if queue is full. */
+    suspend fun enqueueCombatSession(dungeonKey: String, dungeonDisplayName: String): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlags()
         if (flags.sessionQueue.size >= maxQueueSize(flags)) return@withLock false
         val player = getOrCreatePlayer()
@@ -755,10 +749,10 @@ class PlayerRepository @Inject constructor(
             potionKey           = flags.activePotionKey,
             weaponSlot          = weaponSlot,
         ))
-    }
+    }}
 
-    /** Removes and returns the first item in the queue, or null if empty. */
-    suspend fun dequeueNextAction(): QueuedAction? = playerMutex.withLock { dequeueNextActionUnlocked() }
+    /*moves and returns the first item in the queue, or null if empty. */
+    suspend fun dequeueNextAction(): QueuedAction? = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { dequeueNextActionUnlocked() }}
 
     internal suspend fun dequeueNextActionUnlocked(): QueuedAction? {
         val flags = getFlags()
@@ -768,7 +762,7 @@ class PlayerRepository @Inject constructor(
         return queue.first()
     }
 
-    suspend fun requeueActionAtFront(action: QueuedAction) = playerMutex.withLock { requeueActionAtFrontUnlocked(action) }
+    suspend fun requeueActionAtFront(action: QueuedAction) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { requeueActionAtFrontUnlocked(action) }}
 
     internal suspend fun requeueActionAtFrontUnlocked(action: QueuedAction) {
         val flags = getFlags()
@@ -779,8 +773,8 @@ class PlayerRepository @Inject constructor(
     private fun PlayerFlags.withWorkerForSlot(slot: Int, w: HiredWorker?) =
         if (slot == 2) copy(hiredWorker2 = w) else copy(hiredWorker = w)
 
-    /** Appends an action to the given worker slot's queue. Returns false if full (1 item) or no worker hired. */
-    suspend fun enqueueWorkerAction(slot: Int, action: QueuedAction): Boolean = playerMutex.withLock { enqueueWorkerActionUnlocked(slot, action) }
+    /*pends an action to the given worker slot's queue. Returns false if full (1 item) or no worker hired. */
+    suspend fun enqueueWorkerAction(slot: Int, action: QueuedAction): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { enqueueWorkerActionUnlocked(slot, action) }}
 
     internal suspend fun enqueueWorkerActionUnlocked(slot: Int, action: QueuedAction): Boolean {
         val flags = getFlags()
@@ -791,8 +785,8 @@ class PlayerRepository @Inject constructor(
         return true
     }
 
-    /** Removes and returns the first item in the given slot's queue, or null if empty/no worker. */
-    suspend fun dequeueNextWorkerAction(slot: Int): QueuedAction? = playerMutex.withLock { dequeueNextWorkerActionUnlocked(slot) }
+    /*moves and returns the first item in the given slot's queue, or null if empty/no worker. */
+    suspend fun dequeueNextWorkerAction(slot: Int): QueuedAction? = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { dequeueNextWorkerActionUnlocked(slot) }}
 
     internal suspend fun dequeueNextWorkerActionUnlocked(slot: Int): QueuedAction? {
         val flags = getFlags()
@@ -803,7 +797,7 @@ class PlayerRepository @Inject constructor(
         return queue.first()
     }
 
-    suspend fun requeueWorkerActionAtFront(slot: Int, action: QueuedAction) = playerMutex.withLock { requeueWorkerActionAtFrontUnlocked(slot, action) }
+    suspend fun requeueWorkerActionAtFront(slot: Int, action: QueuedAction) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { requeueWorkerActionAtFrontUnlocked(slot, action) }}
 
     internal suspend fun requeueWorkerActionAtFrontUnlocked(slot: Int, action: QueuedAction) {
         val flags = getFlags()
@@ -811,13 +805,13 @@ class PlayerRepository @Inject constructor(
         updateFlagsUnlocked(flags.withWorkerForSlot(slot, worker.copy(sessionQueue = listOf(action) + worker.sessionQueue)))
     }
 
-    suspend fun clearHiredWorker(slot: Int) = playerMutex.withLock {
+    suspend fun clearHiredWorker(slot: Int) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlags()
         updateFlagsUnlocked(flags.withWorkerForSlot(slot, null))
-    }
+    }}
 
-    /** Removes and returns the queued item at [index], or null if out of range. */
-    suspend fun removeFromQueue(index: Int): QueuedAction? = playerMutex.withLock {
+    /*moves and returns the queued item at [index], or null if out of range. */
+    suspend fun removeFromQueue(index: Int): QueuedAction? = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlagsUnlocked()
         val queue = flags.sessionQueue
         if (index < 0 || index >= queue.size) return@withLock null
@@ -825,10 +819,9 @@ class PlayerRepository @Inject constructor(
         val newQueue = queue.toMutableList().apply { removeAt(index) }
         updateFlagsUnlocked(flags.copy(sessionQueue = renumberTowerQueue(newQueue, flags.towerCurrentFloor)))
         removed
-    }
+    }}
 
-    /**
-     * Keeps queued Infinite Tower floors contiguous after a cancellation, so a player can't
+    /*   * Keeps queued Infinite Tower floors contiguous after a cancellation, so a player can't
      * skip floors by cancelling low entries while a higher one survives in the queue.
      */
     private fun renumberTowerQueue(queue: List<QueuedAction>, currentFloor: Int): List<QueuedAction> {
@@ -844,46 +837,45 @@ class PlayerRepository @Inject constructor(
         }
     }
 
-    suspend fun evictQueueForSkill(skillName: String): List<QueuedAction> = playerMutex.withLock {
+    suspend fun evictQueueForSkill(skillName: String): List<QueuedAction> = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlagsUnlocked()
         val (evicted, remaining) = flags.sessionQueue.partition { it.skillName == skillName }
         if (evicted.isNotEmpty()) updateFlagsUnlocked(flags.copy(sessionQueue = remaining))
         evicted
-    }
+    }}
 
-    suspend fun moveQueueItem(fromIndex: Int, toIndex: Int) = playerMutex.withLock {
+    suspend fun moveQueueItem(fromIndex: Int, toIndex: Int) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlagsUnlocked()
         val queue = flags.sessionQueue.toMutableList()
         if (fromIndex < 0 || toIndex < 0 || fromIndex >= queue.size || toIndex >= queue.size) return@withLock
         val item = queue.removeAt(fromIndex)
         queue.add(toIndex, item)
         updateFlagsUnlocked(flags.copy(sessionQueue = queue))
-    }
+    }}
 
-    suspend fun incrementDungeonRun(activityKey: String) = playerMutex.withLock {
+    suspend fun incrementDungeonRun(activityKey: String) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlagsUnlocked()
         val updated = flags.dungeonRuns.toMutableMap()
         updated[activityKey] = (updated[activityKey] ?: 0) + 1
         updateFlagsUnlocked(flags.copy(dungeonRuns = updated))
-    }
+    }}
 
-    suspend fun markWhatsNewSeen(versionCode: Int) = playerMutex.withLock {
+    suspend fun markWhatsNewSeen(versionCode: Int) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         updateFlagsUnlocked(getFlagsUnlocked().copy(lastSeenVersionCode = versionCode))
-    }
+    }}
 
-    /**
-     * [ironman] is only non-null from the first-time creation sheet; edits never change it.
+    /*   * [ironman] is only non-null from the first-time creation sheet; edits never change it.
      * Post-setup race changes are rejected here: they cost a token or coins and go through
      * [changeCharacterRace]. New ironman characters get their race locked at creation.
      */
-    suspend fun updateCharacterProfile(name: String, gender: String, race: String, ironman: Boolean? = null): PrestigeActionResult = playerMutex.withLock {
+    suspend fun updateCharacterProfile(name: String, gender: String, race: String, ironman: Boolean? = null): PrestigeActionResult = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val nowIronman = ironman ?: flags.ironman
         val raceChanged = flags.characterSetupDone &&
             race.lowercase() != PrestigeBoosts.playerRace(flags)
-        // Post-setup race changes cost a token or coins and go through [changeCharacterRace];
-        // this path only handles first-time setup plus name and gender edits.
+        //t-setup race changes cost a token or coins and go through [changeCharacterRace];
+        //s path only handles first-time setup plus name and gender edits.
         if (raceChanged) return@withLock PrestigeActionResult.INVALID
         val updated = flags.copy(
             characterName = name,
@@ -891,27 +883,25 @@ class PlayerRepository @Inject constructor(
             characterRace = race,
             characterSetupDone = true,
             ironman = nowIronman,
-            // New ironman characters can never change race; the choice is final at creation.
+            // ironman characters can never change race; the choice is final at creation.
             ironmanRaceLocked = flags.ironmanRaceLocked || (nowIronman && !flags.characterSetupDone),
         )
         playerDao.upsert(player.copy(flags = json.encode<PlayerFlags>(updated)))
         PrestigeActionResult.SUCCESS
-    }
+    }}
 
-    /**
-     * Race-change bookkeeping. Purchased nodes are kept, including other races'
+    /*   * Race-change bookkeeping. Purchased nodes are kept, including other races'
      * branches: racial bonuses accumulate across switches rather than being refunded.
      */
     private fun applyRaceChange(flags: PlayerFlags, race: String, now: Long): PlayerFlags =
         flags.copy(characterRace = race, raceLastChangedAt = now)
 
-    /**
-     * Appearance-sheet race change. Costs one Race Change Token (rare boss drop) or
+    /*   * Appearance-sheet race change. Costs one Race Change Token (rare boss drop) or
      * [RACE_CHANGE_COST_COINS], chosen via [useToken]. Ironman characters cannot change
      * race at all, except one free legacy change while [PlayerFlags.ironmanRaceLocked]
      * is still false, after which it locks permanently. Same-race saves are free.
      */
-    suspend fun changeCharacterRace(race: String, useToken: Boolean = false): PrestigeActionResult = playerMutex.withLock {
+    suspend fun changeCharacterRace(race: String, useToken: Boolean = false): PrestigeActionResult = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         if (race.lowercase() == PrestigeBoosts.playerRace(flags)) {
@@ -947,19 +937,19 @@ class PlayerRepository @Inject constructor(
             ))
         }
         PrestigeActionResult.SUCCESS
-    }
+    }}
 
-    suspend fun debugChangeRaceFree(race: String) = playerMutex.withLock {
+    suspend fun debugChangeRaceFree(race: String) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         playerDao.upsert(player.copy(flags = json.encode<PlayerFlags>(flags.copy(characterRace = race))))
-    }
+    }}
 
-    suspend fun dismissCharacterSetup() = playerMutex.withLock {
+    suspend fun dismissCharacterSetup() = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         playerDao.upsert(player.copy(flags = json.encode<PlayerFlags>(flags.copy(characterSetupDone = true))))
-    }
+    }}
 
     internal suspend fun updateEquippedUnlocked(equipped: Map<String, String?>) {
         val player = getOrCreatePlayer()
@@ -967,17 +957,16 @@ class PlayerRepository @Inject constructor(
     }
 
     suspend fun updateEquipped(equipped: Map<String, String?>) =
-        playerMutex.withLock { updateEquippedUnlocked(equipped) }
+        RealitySimulator.withSimulatorBoundary { playerMutex.withLock { updateEquippedUnlocked(equipped) } }
 
-    /**
-     * Re-applies [style]'s remembered loadout: armor (EquipSlot.ARMOR_SLOTS; weapons are
+    /*   * Re-applies [style]'s remembered loadout: armor (EquipSlot.ARMOR_SLOTS; weapons are
      * untouched, since each style already has its own persistent weapon slot), plus the
      * remembered arrow (ranged) or spell (magic). Slots/values never recorded for this style are
      * left exactly as currently equipped, and the applied result is then snapshotted back as the
      * style's complete loadout so the next switch is deterministic. Entries referencing an item
      * the player no longer owns, or doesn't meet the level requirement for, are skipped silently.
      */
-    suspend fun applyLoadout(style: String, equipment: Map<String, EquipmentData>) = playerMutex.withLock {
+    suspend fun applyLoadout(style: String, equipment: Map<String, EquipmentData>) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val inventory: Map<String, Int> = json.decodeFromString(player.inventory)
@@ -985,10 +974,10 @@ class PlayerRepository @Inject constructor(
         val currentEquipped: Map<String, String?> = json.decodeFromString(player.equipped)
         val newEquipped = currentEquipped.toMutableMap()
 
-        // If this style's own weapon is two-handed, SHIELD must come off. Clearing it (not
-        // just skipping the restore) matters: the previous style's shield is still in
-        // newEquipped, so it would show equipped alongside the 2H weapon and the snapshot
-        // below would record it into this style's loadout (issue #1601).
+        //this style's own weapon is two-handed, SHIELD must come off. Clearing it (not
+        //t skipping the restore) matters: the previous style's shield is still in
+        //Equipped, so it would show equipped alongside the 2H weapon and the snapshot
+        //ow would record it into this style's loadout (issue #1601).
         val weaponSlotForStyle = EquipSlot.WEAPON_SLOTS.firstOrNull { EquipSlot.combatStyleForSlot(it) == style }
         val twoHanded = equipment[currentEquipped[weaponSlotForStyle]]?.twoHanded == true
         if (twoHanded) newEquipped[EquipSlot.SHIELD] = null
@@ -1006,16 +995,16 @@ class PlayerRepository @Inject constructor(
                     val owned = (inventory[configuredKey] ?: 0) > 0
                     val levelOk = item != null && item.requirements.all { (skill, lvl) -> (skillLevels[skill] ?: 1) >= lvl }
                     if (item != null && owned && levelOk) newEquipped[slot] = configuredKey
-                    // else: skip -- leave whatever's currently there
+                    //e: skip -- leave whatever's currently there
                 }
             }
         }
         if (newEquipped != currentEquipped) updateEquippedUnlocked(newEquipped)
 
         var newFlags = flags
-        // Snapshot the applied result as this style's complete loadout. Legacy sparse
-        // loadouts only pinned explicitly-changed slots, so the rest inherited the
-        // previous tab's gear and switching was path-dependent (issue #1224).
+        //pshot the applied result as this style's complete loadout. Legacy sparse
+        //douts only pinned explicitly-changed slots, so the rest inherited the
+        //vious tab's gear and switching was path-dependent (issue #1224).
         val snapshot = EquipSlot.ARMOR_SLOTS.associateWith { newEquipped[it] }
         if (flags.armorLoadouts[style] != snapshot) {
             newFlags = newFlags.copy(armorLoadouts = flags.armorLoadouts + (style to snapshot))
@@ -1028,18 +1017,18 @@ class PlayerRepository @Inject constructor(
             if (spellName != null) newFlags = newFlags.copy(activeSpell = spellName)
         }
         if (newFlags != flags) updateFlagsUnlocked(newFlags)
-    }
+    }}
 
-    suspend fun updatePets(pets: List<OwnedPet>) = playerMutex.withLock {
+    suspend fun updatePets(pets: List<OwnedPet>) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         playerDao.upsert(player.copy(pets = json.encode<List<OwnedPet>>(pets)))
-    }
+    }}
 
-    /** Buy [qty] of [itemKey] at [priceEach] coins. Returns false if insufficient coins. */
-    suspend fun buyItem(itemKey: String, qty: Int, priceEach: Int): Boolean = playerMutex.withLock {
+    /*y [qty] of [itemKey] at [priceEach] coins. Returns false if insufficient coins. */
+    suspend fun buyItem(itemKey: String, qty: Int, priceEach: Int): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val total  = priceEach.toLong() * qty
-        if (player.coins < total) return false
+        if (player.coins < total) return@withSimulatorBoundary false
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
         inventory[itemKey] = (inventory[itemKey] ?: 0) + qty
         val flags: PlayerFlags = json.decodeFromString(player.flags)
@@ -1050,21 +1039,20 @@ class PlayerRepository @Inject constructor(
                 flags     = json.encode<PlayerFlags>(flags.plusSeen(listOf(itemKey))),
             )
         )
-        return true
-    }
+        return@withSimulatorBoundary true
+    }}
 
-    /** Sell [qty] of [itemKey] for [priceEach] coins each. Returns false if not enough in inventory. Unequips the item if no copies remain. */
-    /**
-     * With [protectEquipped] the sale is refused outright unless [qty] copies can go while
+    /*ll [qty] of [itemKey] for [priceEach] coins each. Returns false if not enough in inventory. Unequips the item if no copies remain. */
+    /*   * With [protectEquipped] the sale is refused outright unless [qty] copies can go while
      * every equipped or loadout-remembered copy stays: the bulk-sell paths pass it so a
      * preview gone stale (gear swapped by a queued session while its dialog was open) can
      * never strip worn gear and silently unequip it (issue #1630).
      */
-    suspend fun sellItem(itemKey: String, qty: Int, priceEach: Int, protectEquipped: Boolean = false): Boolean = playerMutex.withLock {
+    suspend fun sellItem(itemKey: String, qty: Int, priceEach: Int, protectEquipped: Boolean = false): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
         val equipped: MutableMap<String, String?> = json.decodeFromString(player.equipped)
-        if ((inventory[itemKey] ?: 0) < qty) return false
+        if ((inventory[itemKey] ?: 0) < qty) return@withSimulatorBoundary false
         if (protectEquipped) {
             val flags: PlayerFlags = json.decodeFromString(player.flags)
             val loadoutReferenced = flags.armorLoadouts.values.any { itemKey in it.values }
@@ -1072,7 +1060,7 @@ class PlayerRepository @Inject constructor(
                 equipped.values.count { it == itemKey },
                 if (loadoutReferenced) 1 else 0,
             )
-            if ((inventory[itemKey] ?: 0) - qty < protectedCopies) return false
+            if ((inventory[itemKey] ?: 0) - qty < protectedCopies) return@withSimulatorBoundary false
         }
         val remaining = (inventory[itemKey] ?: 0) - qty
         if (remaining <= 0) inventory.remove(itemKey) else inventory[itemKey] = remaining
@@ -1088,11 +1076,10 @@ class PlayerRepository @Inject constructor(
                 equipped  = json.encode<Map<String, String?>>(equipped),
             )
         )
-        return true
-    }
+        return@withSimulatorBoundary true
+    }}
 
-    /**
-     * Apply combat session results: XP distributed across multiple skills (doubled if
+    /*   * Apply combat session results: XP distributed across multiple skills (doubled if
      * boost active), loot added to inventory, coins added to the coins field.
      * Returns the keys of any skill capes awarded (level 99 reached for the first time).
      */
@@ -1103,9 +1090,9 @@ class PlayerRepository @Inject constructor(
         efficiencyMultiplier: Float = 1.0f,
         perSkillPetBoostPct: Map<String, Int> = emptyMap(),
         sessionId: String? = null,
-    ): List<String> = playerMutex.withLock {
+    ): List<String> = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         applyMultiSkillResultsUnlocked(xpPerSkill, itemsGained, coinsGained, efficiencyMultiplier, perSkillPetBoostPct, sessionId)
-    }
+    }}
 
     internal suspend fun applyMultiSkillResultsUnlocked(
         xpPerSkill: Map<String, Long>,
@@ -1118,8 +1105,8 @@ class PlayerRepository @Inject constructor(
         val player    = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val capeMult = prayerCapeMult(player, flags)
-        // Sigil stones apply game-wide; xp mult folds into each skill's finalXp below,
-        // loot mult scales items here, coin mult multiplies the coin write.
+        //il stones apply game-wide; xp mult folds into each skill's finalXp below,
+        //t mult scales items here, coin mult multiplies the coin write.
         val sigils = sigilBonusesFrom(flags)
         val coinBlessingMult = if (flags.ironman) 1.0f else ChurchRepository.coinMultiplier(flags, capeMult, gameData.blessings) *
             gooseCoinMultiplier(json.decodeFromString(player.pets)).toFloat()
@@ -1181,8 +1168,7 @@ class PlayerRepository @Inject constructor(
         val prestigeXpPct: Int,
     )
 
-    /**
-     * Read-only preview of what a flat XP grant (quest/guild-quest/XP lamp reward) to [skillName]
+    /*   * Read-only preview of what a flat XP grant (quest/guild-quest/XP lamp reward) to [skillName]
      * will actually total once boost/blessing/prestige are applied, mirroring the math in
      * [applySessionResults]/[applyMultiSkillResultsUnlocked]. Used so confirmation UI can disclose
      * the real credited XP instead of the pre-multiplier flat amount.
@@ -1198,21 +1184,20 @@ class PlayerRepository @Inject constructor(
         return FlatXpBreakdown(baseXp, finalXp, boostFactor, blessingMult, prestigeXpPct)
     }
 
-    /**
-     * Activates the 2× XP boost for [durationMs]. Refused while a boost is already running
+    /*   * Activates the 2× XP boost for [durationMs]. Refused while a boost is already running
      * (no stacking) and limited to one purchase per weekly reset (Monday 6am, same clock as
      * weekly quests). Deducts [cost] coins on success.
      */
-    suspend fun activateXpBoost(durationMs: Long, cost: Long = XP_BOOST_COST): XpBoostPurchaseResult = playerMutex.withLock {
+    suspend fun activateXpBoost(durationMs: Long, cost: Long = XP_BOOST_COST): XpBoostPurchaseResult = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val now = System.currentTimeMillis()
 
-        if (flags.xpBoostExpiresAt > now) return XpBoostPurchaseResult.ALREADY_ACTIVE
+        if (flags.xpBoostExpiresAt > now) return@withSimulatorBoundary XpBoostPurchaseResult.ALREADY_ACTIVE
         if (flags.xpBoostLastPurchaseAt > 0 && now < weeklyQuestRepo.nextResetMs(flags.xpBoostLastPurchaseAt, flags.dailyResetHour)) {
-            return XpBoostPurchaseResult.WEEKLY_LIMIT_REACHED
+            return@withSimulatorBoundary XpBoostPurchaseResult.WEEKLY_LIMIT_REACHED
         }
-        if (player.coins < cost) return XpBoostPurchaseResult.NOT_ENOUGH_COINS
+        if (player.coins < cost) return@withSimulatorBoundary XpBoostPurchaseResult.NOT_ENOUGH_COINS
 
         val newExpiry = now + durationMs
         playerDao.upsert(
@@ -1226,11 +1211,10 @@ class PlayerRepository @Inject constructor(
         )
         buffNotifScheduler.cancelXpBoostExpiry()
         buffNotifScheduler.scheduleXpBoostExpiry(newExpiry)
-        return XpBoostPurchaseResult.SUCCESS
-    }
+        return@withSimulatorBoundary XpBoostPurchaseResult.SUCCESS
+    }}
 
-    /**
-     * Grants [durationMs] of 2× XP boost as a reward (seasonal event tiers). No cost, exempt
+    /*   * Grants [durationMs] of 2× XP boost as a reward (seasonal event tiers). No cost, exempt
      * from the purchase limits, and extends any boost already running so the reward is never lost.
      */
     internal suspend fun grantXpBoostUnlocked(durationMs: Long) {
@@ -1247,9 +1231,9 @@ class PlayerRepository @Inject constructor(
         buffNotifScheduler.scheduleXpBoostExpiry(newExpiry)
     }
 
-    suspend fun grantXpBoost(durationMs: Long) = playerMutex.withLock { grantXpBoostUnlocked(durationMs) }
+    suspend fun grantXpBoost(durationMs: Long) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { grantXpBoostUnlocked(durationMs) }}
 
-    /** Bronze/starter fallback item granted to a slot if prestige invalidates its gear and nothing else in inventory qualifies. */
+    /*onze/starter fallback item granted to a slot if prestige invalidates its gear and nothing else in inventory qualifies. */
     private val prestigeStarterGearForSlot = mapOf(
         EquipSlot.WEAPON_ATK    to "bronze_sword",
         EquipSlot.WEAPON_STR    to "bronze_warhammer",
@@ -1266,8 +1250,7 @@ class PlayerRepository @Inject constructor(
         EquipSlot.HOE           to "bronze_hoe",
     )
 
-    /**
-     * Resets [skillName] back to level 1, increments its prestige count, and awards
+    /*   * Resets [skillName] back to level 1, increments its prestige count, and awards
      * prestige points ([PrestigePoints.pointsForXp]: 2 at level 99, more for banked
      * XP past 99). Guards: level 99+ and something left to earn (lifetime points
      * below the tree's cap, or an auto XP tier not yet reached).
@@ -1276,7 +1259,7 @@ class PlayerRepository @Inject constructor(
      * longer meets its requirements is swapped for the best valid item in inventory, or a
      * bronze/starter fallback, or unequipped if neither is available.
      */
-    suspend fun prestigeSkill(skillName: String) = playerMutex.withLock {
+    suspend fun prestigeSkill(skillName: String) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val levels: MutableMap<String, Int>  = json.decodeFromString(player.skillLevels)
         val xpMap:  MutableMap<String, Long> = json.decodeFromString(player.skillXp)
@@ -1329,14 +1312,14 @@ class PlayerRepository @Inject constructor(
         var newFlags = flags.copy(
             skillPrestige        = newPrestige,
             prestigePointsEarned = newEarned,
-            // Compensation for the banked-dailies reset below: a 48h 2x XP boost for just
-            // this skill, so the fast climb back is a feature instead of an exploit.
+            //pensation for the banked-dailies reset below: a 48h 2x XP boost for just
+            //s skill, so the fast climb back is a feature instead of an exploit.
             prestigeXpBoosts     = flags.prestigeXpBoosts +
                 (skillName to System.currentTimeMillis() + PRESTIGE_XP_BOOST_DURATION_MS),
         )
-        // Completed-but-unclaimed dailies would otherwise bank their flat XP across the
-        // reset and cash it in at level 1 for an outsized jump, so unclaimed progress on
-        // dailies paying this skill's XP is cleared.
+        //pleted-but-unclaimed dailies would otherwise bank their flat XP across the
+        //et and cash it in at level 1 for an outsized jump, so unclaimed progress on
+        //lies paying this skill's XP is cleared.
         val bankedDailyIds = gameData.guildDailyPool
             .filter { it.rewards.xpSkill == skillName && it.id !in flags.guildDailyClaimed }
             .map { it.id }
@@ -1358,8 +1341,8 @@ class PlayerRepository @Inject constructor(
             val prayerLevel = levels[Skills.PRAYER] ?: 1
             val activeBlessing = ChurchRepository.activeBlessing(newFlags, gameData.blessings)
             if (activeBlessing != null && activeBlessing.prayerLevelRequired > prayerLevel) {
-                // The bones are already paid, so the blessing downgrades (keeping its expiry)
-                // to the strongest same-type blessing the reset level allows instead of ending.
+                // bones are already paid, so the blessing downgrades (keeping its expiry)
+                //the strongest same-type blessing the reset level allows instead of ending.
                 val fallback = gameData.blessings
                     .filter { it.type == activeBlessing.type && it.prayerLevelRequired <= prayerLevel }
                     .maxByOrNull { it.prayerLevelRequired }
@@ -1381,13 +1364,12 @@ class PlayerRepository @Inject constructor(
                 equipped    = json.encode<Map<String, String?>>(equipped),
             )
         )
-    }
+    }}
 
-    /**
-     * Buys a prestige tree node with unspent points. Validates race lock, the
+    /*   * Buys a prestige tree node with unspent points. Validates race lock, the
      * preceding tier in the same path, and available points.
      */
-    suspend fun purchasePrestigeNode(skillName: String, nodeId: String): PrestigeActionResult = playerMutex.withLock {
+    suspend fun purchasePrestigeNode(skillName: String, nodeId: String): PrestigeActionResult = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val tree = gameData.prestigeTrees[skillName] ?: return@withLock PrestigeActionResult.INVALID
@@ -1400,7 +1382,7 @@ class PlayerRepository @Inject constructor(
         if (nodeId in owned) return@withLock PrestigeActionResult.INVALID
         val race = PrestigeBoosts.playerRace(flags)
         if (!PrestigeBoosts.isNodeAvailableToRace(node, race)) return@withLock PrestigeActionResult.LOCKED
-        // Prerequisite: the closest preceding node in this path that this race can use.
+        //requisite: the closest preceding node in this path that this race can use.
         val prereq = path.nodes.take(index).lastOrNull { PrestigeBoosts.isNodeAvailableToRace(it, race) }
         if (prereq != null && prereq.id !in owned) return@withLock PrestigeActionResult.LOCKED
         if (PrestigeBoosts.unspentPoints(gameData.prestigeTrees, flags, skillName) < node.cost) {
@@ -1410,10 +1392,10 @@ class PlayerRepository @Inject constructor(
             flags.copy(prestigeNodes = flags.prestigeNodes + (skillName to (owned + nodeId)))
         )))
         PrestigeActionResult.SUCCESS
-    }
+    }}
 
-    /** Refunds every purchased node of [skillName] (points return automatically). 24h cooldown per skill. */
-    suspend fun respecPrestige(skillName: String): PrestigeActionResult = playerMutex.withLock {
+    /*funds every purchased node of [skillName] (points return automatically). 24h cooldown per skill. */
+    suspend fun respecPrestige(skillName: String): PrestigeActionResult = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         if (flags.prestigeNodes[skillName].orEmpty().isEmpty()) return@withLock PrestigeActionResult.INVALID
@@ -1426,13 +1408,12 @@ class PlayerRepository @Inject constructor(
             prestigeLastRespecAt = flags.prestigeLastRespecAt + (skillName to now),
         ))))
         PrestigeActionResult.SUCCESS
-    }
+    }}
 
-    /**
-     * One-time v1.14.0 migration: convert legacy prestige levels (which used to grant
+    /*   * One-time v1.14.0 migration: convert legacy prestige levels (which used to grant
      * automatic bonuses) into unspent prestige points, 2 per level, for free allocation.
      */
-    suspend fun migrateLegacyPrestigePointsIfNeeded() = playerMutex.withLock {
+    suspend fun migrateLegacyPrestigePointsIfNeeded() = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         if (flags.prestigePointsMigrated) return@withLock
@@ -1444,13 +1425,13 @@ class PlayerRepository @Inject constructor(
             prestigePointsEarned   = flags.prestigePointsEarned + granted,
             prestigePointsMigrated = true,
         ))))
-    }
+    }}
 
     companion object {
         const val XP_BOOST_COST = 2_500_000L
-        const val XP_BOOST_DURATION_MS = 48 * 3_600_000L   // 48 hours
+        const val XP_BOOST_DURATION_MS = 48 * 3_600_000L   //hours
 
-        /** Duration of the skill-specific 2x XP boost granted by each prestige. */
+        /*ration of the skill-specific 2x XP boost granted by each prestige. */
         const val PRESTIGE_XP_BOOST_DURATION_MS = 48 * 3_600_000L
 
         const val PRESTIGE_RESPEC_COOLDOWN_MS = 24 * 3_600_000L
@@ -1458,10 +1439,10 @@ class PlayerRepository @Inject constructor(
         const val RACE_CHANGE_COST_COINS = 10_000_000L
         const val RACE_CHANGE_COOLDOWN_MS = 24L * 60L * 60L * 1000L
 
-        /** HMAC key for save-file signatures. Public by nature (open source), deterrence only. */
+        /*AC key for save-file signatures. Public by nature (open source), deterrence only. */
         private const val SAVE_SIG_KEY = "ekEhdMIDo9B63HQSU80U7hvuqVd1HYcciv5Na5d7gEKdaudR4Voa8jkF"
 
-        /** Kills of each boss per day that pay full coin drops; kills beyond pay [BOSS_COIN_SOFT_CAP_MULT]. */
+        /*lls of each boss per day that pay full coin drops; kills beyond pay [BOSS_COIN_SOFT_CAP_MULT]. */
         const val BOSS_FULL_COIN_KILLS_PER_DAY = 3
         const val BOSS_COIN_SOFT_CAP_MULT = 0.25
 
@@ -1470,13 +1451,12 @@ class PlayerRepository @Inject constructor(
         const val TREASURE_COIN_MAX = 400L
         const val TREASURE_GEM_CHANCE = 0.25
 
-        /** Coin-drop multiplier from the Golden Goose pet (Monument stage 4); applies wherever Fortune blessings do. */
+        /*in-drop multiplier from the Golden Goose pet (Monument stage 4); applies wherever Fortune blessings do. */
         fun gooseCoinMultiplier(pets: List<OwnedPet>): Double =
             1.0 + (pets.firstOrNull { it.id == MonumentRepository.GOLDEN_GOOSE_PET_ID }?.boostPercent ?: 0) / 100.0
     }
 
-    /**
-     * Atomically craft [quantity] of a recipe:
+    /*   * Atomically craft [quantity] of a recipe:
      *   1. Verify and consume [materialsPerItem] × [quantity]
      *   2. Add [outputKey] × ([outputQtyPerItem] × [quantity]) to inventory
      *   3. Award [xpPerItem] × [quantity] XP to [skillName]
@@ -1496,12 +1476,12 @@ class PlayerRepository @Inject constructor(
         val levels:    MutableMap<String, Int>  = json.decodeFromString(player.skillLevels)
         val xpMap:     MutableMap<String, Long> = json.decodeFromString(player.skillXp)
 
-        // Check all materials are available
+        //ck all materials are available
         for ((item, needed) in materialsPerItem) {
             if ((inventory[item] ?: 0) < needed * quantity) return false
         }
 
-        // Consume materials; input-save prestige nodes refund a fraction of them.
+        //sume materials; input-save prestige nodes refund a fraction of them.
         val flagsForSave: PlayerFlags = json.decodeFromString(player.flags)
         val saveFraction = boostRepo.inputSaveFraction(skillName, flagsForSave)
         for ((item, needed) in materialsPerItem) {
@@ -1511,11 +1491,11 @@ class PlayerRepository @Inject constructor(
             if (remaining <= 0) inventory.remove(item) else inventory[item] = remaining
         }
 
-        // Add output
+        // output
         val totalOut = outputQtyPerItem * quantity
         inventory[outputKey] = (inventory[outputKey] ?: 0) + totalOut
 
-        // Add XP and recalculate level
+        // XP and recalculate level
         val xpGained = (xpPerItem * quantity).toLong()
         val newXp    = (xpMap[skillName] ?: 0L) + xpGained
         xpMap[skillName]    = newXp
@@ -1534,8 +1514,7 @@ class PlayerRepository @Inject constructor(
         return true
     }
 
-    /**
-     * Pre-1.8.6 bug: pet drops went into inventory instead of the pet list because
+    /*   * Pre-1.8.6 bug: pet drops went into inventory instead of the pet list because
      * pet keys were absent from pets.json. Moves any matching inventory items into
      * the OwnedPet list and removes them from inventory.
      */
@@ -1556,13 +1535,12 @@ class PlayerRepository @Inject constructor(
         ))
     }
 
-    /**
-     * Adds [petId] to the player's pet list if not already owned.
+    /*   * Adds [petId] to the player's pet list if not already owned.
      * Returns true if the pet was newly added, false if already owned.
      */
-    suspend fun addPetIfNew(petId: String, boostPercent: Int = 0): Boolean = playerMutex.withLock {
+    suspend fun addPetIfNew(petId: String, boostPercent: Int = 0): Boolean = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         addPetIfNewUnlocked(petId, boostPercent)
-    }
+    }}
 
     internal suspend fun addPetIfNewUnlocked(petId: String, boostPercent: Int = 0): Boolean {
         val player = getOrCreatePlayer()
@@ -1573,8 +1551,7 @@ class PlayerRepository @Inject constructor(
         return true
     }
 
-    /**
-     * Removes [materialsPerItem] × [quantity] from inventory.
+    /*   * Removes [materialsPerItem] × [quantity] from inventory.
      * Returns false (no changes) if the player lacks any required material.
      */
     suspend fun consumeMaterials(
@@ -1595,7 +1572,7 @@ class PlayerRepository @Inject constructor(
         return true
     }
 
-    /** Returns a JSON string capturing the full player save including quest progress and sessions. */
+    /*turns a JSON string capturing the full player save including quest progress and sessions. */
     suspend fun exportSave(sessions: List<SkillSessionExport> = emptyList()): String {
         val player = getOrCreatePlayer()
         val export = PlayerExport(
@@ -1614,15 +1591,14 @@ class PlayerRepository @Inject constructor(
         return json.encode<PlayerExport>(export.copy(sig = saveSignature(export)))
     }
 
-    /** Result of [importSave]: the applied export, and whether an edited ironman save was demoted. */
+    /*sult of [importSave]: the applied export, and whether an edited ironman save was demoted. */
     data class ImportedSave(val export: PlayerExport, val ironmanDemoted: Boolean)
 
-    /**
-     * Overwrites the current save with data from a previously exported JSON string.
+    /*   * Overwrites the current save with data from a previously exported JSON string.
      * An ironman save whose signature is missing or does not match its core fields was edited
      * outside the game; it still imports, but as a regular (non-ironman) character.
      */
-    suspend fun importSave(jsonString: String): ImportedSave = playerMutex.withLock {
+    suspend fun importSave(jsonString: String): ImportedSave = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         var export = json.decodeFromString<PlayerExport>(stripJsonGarbage(jsonString))
         var ironmanDemoted = false
         val importedFlags = try { json.decodeFromString<PlayerFlags>(export.flags) } catch (_: Exception) { null }
@@ -1649,10 +1625,9 @@ class PlayerRepository @Inject constructor(
             export.farmingPatches.forEach { farmingPatchDao.upsert(it) }
         }
         ImportedSave(export, ironmanDemoted)
-    }
+    }}
 
-    /**
-     * HMAC-SHA256 over the seven core player fields, joined by newlines. The raw JSON strings
+    /*   * HMAC-SHA256 over the seven core player fields, joined by newlines. The raw JSON strings
      * round-trip byte-for-byte through export parsing, and later PlayerExport schema additions
      * don't affect the canonical form, so old signed saves stay valid across app versions.
      * Deterrence against hand-editing only: the key is public in this open-source app.
@@ -1667,8 +1642,8 @@ class PlayerRepository @Inject constructor(
         return mac.doFinal(canonical.toByteArray()).joinToString("") { "%02x".format(it) }
     }
 
-    // Finds the end of the root JSON object and drops any trailing garbage.
-    // Guards against files that were written twice without truncation.
+    //ds the end of the root JSON object and drops any trailing garbage.
+    //rds against files that were written twice without truncation.
     private fun stripJsonGarbage(s: String): String {
         var depth = 0
         var inString = false
@@ -1694,18 +1669,17 @@ class PlayerRepository @Inject constructor(
         playerDao.upsert(createDefaultPlayer(ironman, carrySettingsFrom = previousFlags))
     }
 
-    // ------------------------------------------------------------------
-    // Daily quest helpers
-    // ------------------------------------------------------------------
+    //---------------------------------------------------------------
+    //ly quest helpers
+    //---------------------------------------------------------------
 
-    /**
-     * Runs the 6am daily/weekly refresh plus [transform] on the freshest flags under a single
+    /*   * Runs the 6am daily/weekly refresh plus [transform] on the freshest flags under a single
      * lock hold. The previous flows read flags, transformed, and wrote back across separate
      * lock acquisitions, so a concurrent flags writer (e.g. the prestige flow while a session
      * collect was still recording progress) could clobber either side's update — most visibly
      * resurrecting already-claimed dailies.
      */
-    private suspend fun updateRefreshedDailyFlagsAtomically(transform: (PlayerFlags) -> PlayerFlags) = playerMutex.withLock {
+    private suspend fun updateRefreshedDailyFlagsAtomically(transform: (PlayerFlags) -> PlayerFlags) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val original: PlayerFlags = json.decodeFromString(player.flags)
         var flags = original
@@ -1718,9 +1692,9 @@ class PlayerRepository @Inject constructor(
         }
         flags = transform(flags)
         if (flags != original) updateFlagsUnlocked(flags)
-    }
+    }}
 
-    /** Refresh daily and weekly quests if past 6am, then record progress for a gather session. */
+    /*fresh daily and weekly quests if past 6am, then record progress for a gather session. */
     suspend fun recordDailyGathering(items: Map<String, Int>) = updateRefreshedDailyFlagsAtomically { refreshed ->
         var flags = refreshed
         for ((target, amount) in items) {
@@ -1730,7 +1704,7 @@ class PlayerRepository @Inject constructor(
         flags
     }
 
-    /** Refresh daily and weekly quests if past 6am, then record progress for a crafting session. */
+    /*fresh daily and weekly quests if past 6am, then record progress for a crafting session. */
     suspend fun recordDailyCrafting(items: Map<String, Int>) = updateRefreshedDailyFlagsAtomically { refreshed ->
         var flags = refreshed
         for ((target, amount) in items) {
@@ -1740,7 +1714,7 @@ class PlayerRepository @Inject constructor(
         flags
     }
 
-    /** Refresh daily and weekly quests if past 6am, then record progress for combat kills. */
+    /*fresh daily and weekly quests if past 6am, then record progress for combat kills. */
     suspend fun recordDailyKills(killsByEnemy: Map<String, Int>) = updateRefreshedDailyFlagsAtomically { refreshed ->
         var flags = refreshed
         for ((enemy, count) in killsByEnemy) {
@@ -1755,7 +1729,7 @@ class PlayerRepository @Inject constructor(
         flags
     }
 
-    /** Refresh daily quests if past 6am, then record bones buried. */
+    /*fresh daily quests if past 6am, then record bones buried. */
     suspend fun recordDailyPrayer(amount: Int) = updateRefreshedDailyFlagsAtomically { refreshed ->
         var flags = refreshed
         flags = dailyQuestRepo.recordPrayerProgress(flags, amount)
@@ -1763,13 +1737,13 @@ class PlayerRepository @Inject constructor(
         flags
     }
 
-    /** Record arbitrary weekly progress (for new weekly quest types). */
+    /*cord arbitrary weekly progress (for new weekly quest types). */
     suspend fun recordWeeklyProgress(type: String, target: String, amount: Int) = updateRefreshedDailyFlagsAtomically { refreshed ->
         weeklyQuestRepo.recordProgress(refreshed, type, target, amount)
     }
 
-    /** Returns current flags after refreshing daily and weekly quests if the boundary has passed. */
-    suspend fun getRefreshedDailyFlags(): PlayerFlags = playerMutex.withLock {
+    /*turns current flags after refreshing daily and weekly quests if the boundary has passed. */
+    suspend fun getRefreshedDailyFlags(): PlayerFlags = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         var flags: PlayerFlags = json.decodeFromString(player.flags)
         var changed = false
@@ -1789,10 +1763,9 @@ class PlayerRepository @Inject constructor(
             updateFlagsUnlocked(flags)
         }
         flags
-    }
+    }}
 
-    /**
-     * Atomically claims a completed daily quest: the flags read, the claimed marker, and any
+    /*   * Atomically claims a completed daily quest: the flags read, the claimed marker, and any
      * Dwarven item grant all happen under one lock hold and land in one DB upsert. The previous
      * flow read flags in the ViewModel and wrote them back afterwards, so a concurrent flags
      * writer (e.g. the prestige flow) could clobber the claim and let it be claimed again.
@@ -1800,7 +1773,7 @@ class PlayerRepository @Inject constructor(
      * Returns the reward, or null when the quest isn't complete or is already claimed (double
      * tap). Coin rewards are still credited by the caller — coins don't touch this row.
      */
-    suspend fun claimDailyQuest(templateId: String): DailyReward? = playerMutex.withLock {
+    suspend fun claimDailyQuest(templateId: String): DailyReward? = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
@@ -1821,11 +1794,11 @@ class PlayerRepository @Inject constructor(
             )
         )
         reward
-    }
+    }}
 
-    /** Atomically claims a completed weekly quest (same lost-update guard as [claimDailyQuest]).
+    /*omically claims a completed weekly quest (same lost-update guard as [claimDailyQuest]).
      *  Returns the coin reward, or null when it isn't complete or is already claimed. */
-    suspend fun claimWeeklyQuest(templateId: String): Long? = playerMutex.withLock {
+    suspend fun claimWeeklyQuest(templateId: String): Long? = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val flags = getFlagsUnlocked()
         val (newFlags, rewardCoins) = try {
             weeklyQuestRepo.claimQuest(flags, templateId)
@@ -1834,15 +1807,14 @@ class PlayerRepository @Inject constructor(
         }
         updateFlagsUnlocked(newFlags)
         rewardCoins
-    }
+    }}
 
-    /**
-     * Atomically claims the weekly bonus: flags (weeklyBonusClaimed = true) and any Divine item
+    /*   * Atomically claims the weekly bonus: flags (weeklyBonusClaimed = true) and any Divine item
      * grant land in one DB upsert under one lock hold (same lost-update guard as
      * [claimDailyQuest]). Returns the reward, or null when not all weeklies are claimed or the
      * bonus was already taken. Coin rewards are credited by the caller.
      */
-    suspend fun claimWeeklyBonus(): WeeklyBonusReward? = playerMutex.withLock {
+    suspend fun claimWeeklyBonus(): WeeklyBonusReward? = RealitySimulator.withSimulatorBoundary { playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         if (flags.weeklyQuestClaimed.size < 5 || flags.weeklyBonusClaimed) return@withLock null
@@ -1860,10 +1832,10 @@ class PlayerRepository @Inject constructor(
             )
         )
         reward
-    }
+    }}
 
-    /** Adds [qty] of [itemKey] to inventory. */
-    suspend fun addItem(itemKey: String, amount: Int = 1) = playerMutex.withLock { addItemUnlocked(itemKey, amount) }
+    /*ds [qty] of [itemKey] to inventory. */
+    suspend fun addItem(itemKey: String, amount: Int = 1) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { addItemUnlocked(itemKey, amount) }}
 
     internal suspend fun addItemUnlocked(itemKey: String, amount: Int = 1) {
         if (amount <= 0) return
@@ -1877,8 +1849,8 @@ class PlayerRepository @Inject constructor(
         ))
     }
 
-    /** Adds multiple items to inventory in a single DB write. */
-    suspend fun addItems(items: Map<String, Int>) = playerMutex.withLock { addItemsUnlocked(items) }
+    /*ds multiple items to inventory in a single DB write. */
+    suspend fun addItems(items: Map<String, Int>) = RealitySimulator.withSimulatorBoundary { playerMutex.withLock { addItemsUnlocked(items) }}
 
     internal suspend fun addItemsUnlocked(items: Map<String, Int>) {
         if (items.isEmpty()) return
@@ -1896,7 +1868,7 @@ class PlayerRepository @Inject constructor(
     }
 
 
-    /** Seeds seenItemKeys from current inventory + equipped; always ensures starting items are present. */
+    /*eds seenItemKeys from current inventory + equipped; always ensures starting items are present. */
     suspend fun migrateSeenItems() {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
@@ -1918,9 +1890,9 @@ class PlayerRepository @Inject constructor(
         ))
     }
 
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
+    //---------------------------------------------------------------
+    //pers
+    //---------------------------------------------------------------
 
     private fun createDefaultPlayer(ironman: Boolean = false, carrySettingsFrom: PlayerFlags? = null): Player {
         val defaultEquipped: Map<String, String?> = EquipSlot.ALL.associateWith { null } +
@@ -1939,12 +1911,12 @@ class PlayerRepository @Inject constructor(
         val base = PlayerFlags(
             ironman             = ironman,
             characterCreatedAt  = System.currentTimeMillis(),
-            // A brand-new save has nothing to announce, so What's New stays hidden (issue #1503).
+            //rand-new save has nothing to announce, so What's New stays hidden (issue #1503).
             lastSeenVersionCode = BuildConfig.VERSION_CODE,
         )
-        // App/UI preferences follow the player across new characters and resets (issue #1503).
-        // Backup settings deliberately don't: auto-backups share one file, so a fresh character
-        // inheriting them would overwrite the previous character's backup.
+        ///UI preferences follow the player across new characters and resets (issue #1503).
+        //kup settings deliberately don't: auto-backups share one file, so a fresh character
+        //eriting them would overwrite the previous character's backup.
         val flags = if (carrySettingsFrom == null) base else base.copy(
             themePreference           = carrySettingsFrom.themePreference,
             fontScale                 = carrySettingsFrom.fontScale,
@@ -1975,8 +1947,7 @@ class PlayerRepository @Inject constructor(
         )
     }
 
-    /**
-     * One-time backfill for characters that predate [PlayerFlags.characterCreatedAt]: their
+    /*   * One-time backfill for characters that predate [PlayerFlags.characterCreatedAt]: their
      * oldest quest completion is the earliest record that survives (sessions are deleted on
      * collect). Characters with no completed quests stay unstamped and show no creation line.
      */
@@ -2009,7 +1980,7 @@ internal fun resolveOwnedCapeKeysForSkill(skillName: String): List<String> {
     }
 }
 
-/** Prayer cape multiplier that scales church blessing strength (issue #1491). */
+/*ayer cape multiplier that scales church blessing strength (issue #1491). */
 fun blessingPrayerCapeMult(
     flags: PlayerFlags,
     equipped: Map<String, String?>,
@@ -2025,7 +1996,7 @@ fun blessingPrayerCapeMult(
     )
 }
 
-/** [blessingPrayerCapeMult] convenience for call sites holding a raw [Player] row. */
+/*lessingPrayerCapeMult] convenience for call sites holding a raw [Player] row. */
 fun blessingPrayerCapeMult(player: Player, flags: PlayerFlags, gameData: GameDataRepository): Float {
     if (flags.ironman) return 1f
     return blessingPrayerCapeMult(
@@ -2071,10 +2042,10 @@ fun resolveCapeMultiplier(
         }
     }
 
-    // Check equipped cape
+    //ck equipped cape
     considerCape(equippedCape)
 
-    // Check passive capes in inventory
+    //ck passive capes in inventory
     if (isCategoryUnlocked) {
         val candidateKeys = resolveOwnedCapeKeysForSkill(normSkill)
         for (key in candidateKeys) {
@@ -2087,7 +2058,7 @@ fun resolveCapeMultiplier(
     val totalBonus = bestSkillCapeBonus + bestGuildCapeBonus
     if (totalBonus <= 0f) return 1.0f
 
-    // Cape Mastery prestige nodes scale non-combat cape bonuses (was prestige level + 1).
+    //e Mastery prestige nodes scale non-combat cape bonuses (was prestige level + 1).
     val scaling = capeScaling[normSkill] ?: 1
     val isCombatSkill = normSkill in setOf("attack", "strength", "defense", "ranged", "magic", "hp", "slayer")
     return if (isCombatSkill) {

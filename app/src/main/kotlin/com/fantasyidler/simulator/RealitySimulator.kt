@@ -11,6 +11,7 @@ import com.fantasyidler.repository.SessionRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ThreadContextElement
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,8 +19,11 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.serializer
+import kotlin.coroutines.CoroutineContext
 
 /**
  * Layers 2–3 of the three-layer reality system:
@@ -44,9 +48,11 @@ import kotlinx.serialization.serializer
  * rejected and the temporary state is discarded
  * ("Simulation is no longer valid. Returning to Base Reality.").
  *
- * On death or voluntary exit the temporary state is discarded and the player
- * may bring back up to [MAX_REWARDS] rewards (Stats / Skill Experience /
- * Items) from the gains made in that run.
+ * Layer 2 has no manual exit. The run remains active until the simulated player
+ * dies; death is the single controlled transition back to Layer 1 (Base Reality).
+ * Crash recovery and invalid-save-slot paths discard the temporary state directly
+ * without offering rewards, and those paths are internal only — normal gameplay
+ * never reaches them.
  *
  * Fast Time Simulation (Time Skip) is only available inside the Simulator: it
  * instantly advances the current action's own pre-simulated session frames —
@@ -147,6 +153,100 @@ object RealitySimulator {
      */
     val simSessions: StateFlow<List<SkillSession>> = _simSessions.asStateFlow()
 
+    // ------------------------------------------------------------------ lifecycle synchronization
+    //
+    // Lock ordering: simulatorMutex → playerMutex.  Never acquire simulatorMutex while
+    // already holding playerMutex.  playerMutex is already held by virtually every
+    // repository write; wrapping those writes with withSimulatorBoundary (which takes
+    // simulatorMutex briefly only at entry/exit) preserves that ordering.
+    //
+    // Any coroutine that reads isSimulationActive and then performs one or more DAO calls
+    // (which may suspend — e.g. Room transactions, or nested reads/writes) MUST run inside
+    // withSimulatorBoundary {} so that:
+    //
+    //   1. it pins isSimulationActive once at entry, and
+    //   2. shutdown (death transition, crash recovery, invalidation) waits for it to finish
+    //      before flipping isSimulationActive to false and dropping the temporary state.
+    //
+    // This guarantees the invariant: if an operation sees isSimulationActive == true at its
+    // start, every DAO call it makes also sees true (writes land in sim state); conversely
+    // if it starts in Base Reality, every DAO call stays in Base Reality.
+
+    /**
+     * Mutex serialising lifecycle transitions (enter / death-exit / crash recovery /
+     * invalidation) AND the snapshots taken by [withSimulatorBoundary].  Because lifecycle
+     * transitions need to wait for all in-flight operations to drain before flipping
+     * [isSimulationActive], and because snapshots need to observe a consistent lifecycle
+     * state, both share this mutex.
+     */
+    private val simulatorMutex = Mutex()
+
+    /**
+     * Mutex serialising concurrent enterSimulation() calls so two coroutines cannot
+     * both pass the "isSimulationActive == false" check, release simulatorMutex to take a
+     * snapshot, and then both publish Layer 2 state.
+     */
+    private val entryGate = Mutex()
+
+    /**
+     * Count of operations currently running inside [withSimulatorBoundary].
+     * Only accessed under [simulatorMutex].
+     */
+    private var inFlightOperations: Int = 0
+
+    /**
+     * Monotonic run generation counter. Incremented each time a new Layer 2 session is
+     * successfully published. Every lifecycle action (clearCrashMarker, discard, claim)
+     * captures its generation at start and refuses to mutate state if the generation has
+     * advanced when it is ready to apply — so a stale death/abort/recovery can never
+     * clear a NEWER run's crash marker, checkpoint, or sim state. Starts at 0 (Base
+     * Reality; no active run).
+     */
+    @Volatile
+    private var generation: Long = 0L
+
+    // ------------------------------------------------------------------ pinned-layer plumbing
+    //
+    // PIN THE LAYER, NOT THE DATA. When a withSimulatorBoundary block STARTS we snapshot
+    // WHETHER the operation began in sim (Boolean), propagate it across coroutine
+    // suspensions/dispatch via a ThreadContextElement (coroutine-safe — survives
+    // withContext dispatcher hops, unlike a plain ThreadLocal), and pop it on exit.
+    // All reads/writes from a pinned-to-sim op go against the LIVE _simPlayer /
+    // _simSessions StateFlows so concurrent sim ops observe each other's latest
+    // updates (no lost updates / stale snapshots).
+    //
+    // A per-thread ArrayDeque<Boolean> stack supports nested boundary calls: outermost
+    // wins (nested calls no-op after seeing an active pinned layer) so inFlightOperations
+    // is never double-counted. The ThreadContextElement pushes on entry and pops on
+    // restoreThreadContext, which is invoked on EVERY thread the coroutine resumes on
+    // (including after dispatcher hops).
+
+    private val pinnedStack = ThreadLocal<ArrayDeque<Boolean>>()
+
+    private fun pushPinned(active: Boolean) {
+        var s = pinnedStack.get()
+        if (s == null) { s = ArrayDeque(); pinnedStack.set(s) }
+        s.addLast(active)
+    }
+    private fun popPinned() {
+        val s = pinnedStack.get() ?: return
+        s.removeLast()
+        if (s.isEmpty()) pinnedStack.remove()
+    }
+    /** Returns the pinned flag for the CURRENT thread, or null if not inside a boundary. */
+    private fun pinnedActive(): Boolean? {
+        val s = pinnedStack.get() ?: return null
+        return s.last()
+    }
+
+    private class PinnedSimElement(private val active: Boolean)
+        : ThreadContextElement<Unit> {
+        companion object Key : CoroutineContext.Key<PinnedSimElement>
+        override val key: CoroutineContext.Key<PinnedSimElement> get() = Key
+        override fun updateThreadContext(context: CoroutineContext) { pushPinned(active) }
+        override fun restoreThreadContext(context: CoroutineContext, oldState: Unit) { popPinned() }
+    }
+
     @Volatile
     var isSimulationActive: Boolean = false
         private set
@@ -158,6 +258,10 @@ object RealitySimulator {
     /** Active save slot when the run started; 0 when no run exists. Rewards only ever go back to it. */
     @Volatile
     private var originSlot: Int = 0
+
+    /** The generation that owns the current checkpoint/_simPlayer/_simSessions state. */
+    @Volatile
+    private var activeGeneration: Long = 0L
 
     /** Serializes reward claims so a double tap can never apply the same reward twice. */
     private val claimMutex = Mutex()
@@ -210,38 +314,112 @@ object RealitySimulator {
         flags.simulatorUpgrades[upgradeKey] ?: 0
 
     // ------------------------------------------------------------------ write isolation hooks
+    //
+    // The DAO decorators MUST NOT route based on the LIVE isSimulationActive flag alone: an
+    // operation that reads sim state, suspends, then has death flip the flag underneath it
+    // would otherwise resume and write to the real DAO.  Instead, every hook first checks the
+    // pinned coroutine context (set by withSimulatorBoundary at operation start) — a simple
+    // boolean: "this op started in sim" or "this op started in base".  Reads/writes from a
+    // pinned-to-sim op still go against the LIVE _simPlayer / _simSessions StateFlows so
+    // that concurrent sim ops observe each other's latest changes.  When there is no pinned
+    // context (long-lived Flows, alarm side-effects, callers that bypassed the boundary) we
+    // fall back to the live flag.
 
-    /** Called by [com.fantasyidler.data.db.dao.SimulationPlayerDao] on every player write. */
+    /** True when the CURRENT execution is pinned to Layer 2 (started inside a sim boundary). */
+    internal fun isPinnedToSim(): Boolean = pinnedActive() == true
+
+    /** Returns whether a DAO access from the current execution should hit sim state. */
+    internal fun effectiveActive(): Boolean =
+        pinnedActive() ?: isSimulationActive
+
+    /** Player read: pinned-to-sim reads the live sim player, so concurrent ops see each other. */
+    internal fun effectiveSimPlayer(): Player? {
+        val p = pinnedActive()
+        return if (p != null) {
+            if (p) _simPlayer.value else null
+        } else {
+            if (isSimulationActive) _simPlayer.value else null
+        }
+    }
+
+    /** Sessions read: pinned-to-sim reads the live sim sessions list. */
+    internal fun effectiveSimSessions(): List<SkillSession>? {
+        val p = pinnedActive()
+        return if (p != null) {
+            if (p) _simSessions.value else null
+        } else {
+            if (isSimulationActive) _simSessions.value else null
+        }
+    }
+
+    /** Player write. */
     internal fun onSimWrite(player: Player): Boolean {
-        if (!isSimulationActive) return false
+        if (!effectiveActive()) return false
         _simPlayer.value = player
         return true
     }
 
-    /** Called by [com.fantasyidler.data.db.dao.SimulationPlayerDao] on every flags write. */
+    /** Flags write — uses the LIVE current sim player (not a stale snapshot). */
     internal fun onSimFlagsWrite(flags: String): Boolean {
-        if (!isSimulationActive) return false
+        if (!effectiveActive()) return false
         val current = _simPlayer.value ?: return true
         _simPlayer.value = current.copy(flags = flags)
         return true
     }
 
-    /**
-     * Called by [com.fantasyidler.data.db.dao.SimulationSessionDao] on every session read:
-     * returns the isolated session table while a simulation is active, or null to read the
-     * real DAO instead.
-     */
-    internal fun simSessionsOrNull(): List<SkillSession>? =
-        if (isSimulationActive) _simSessions.value else null
+    /** Session read. */
+    internal fun simSessionsOrNull(): List<SkillSession>? = effectiveSimSessions()
 
-    /**
-     * Called by [com.fantasyidler.data.db.dao.SimulationSessionDao] on every session write.
-     * Returns false when no simulation is active so the caller forwards to the real DAO.
-     */
+    /** Session write: applies [block] to the live sim sessions list when sim-active. */
     internal fun updateSimSessions(block: (List<SkillSession>) -> List<SkillSession>): Boolean {
-        if (!isSimulationActive) return false
+        if (!effectiveActive()) return false
         _simSessions.update(block)
         return true
+    }
+
+    // ------------------------------------------------------------------ lifecycle boundary
+
+    /**
+     * Runs [block] under the simulator lifecycle boundary. Non-inline so coroutine
+     * context propagation (PinnedSimElement) works across suspensions and dispatcher
+     * hops. Callers use labeled returns (`return@withSimulatorBoundary`) for early
+     * exits. Nested calls inherit the outer pinned layer (outermost-wins, no double
+     * counting of inFlightOperations).
+     *
+     * @PublishedApi so inline repository callers in the same module can invoke it.
+     */
+    @PublishedApi
+    internal suspend fun <T> withSimulatorBoundary(block: suspend () -> T): T {
+        if (pinnedActive() != null) return block()
+        val active = simulatorMutex.withLock {
+            inFlightOperations++
+            isSimulationActive
+        }
+        try {
+            return withContext(PinnedSimElement(active)) { block() }
+        } finally {
+            simulatorMutex.withLock { inFlightOperations-- }
+        }
+    }
+
+    /**
+     * Wait under [simulatorMutex] until every in-flight [withSimulatorBoundary] block has
+     * finished.  Used by lifecycle transitions to drain outstanding operations before
+     * flipping the active flag — the flip itself is what keeps future DAO calls out of the
+     * (now-destroyed) sim state, so we must be sure no in-flight op is mid-write.
+     */
+    private suspend fun awaitDrainInFlight() {
+        // Spin-yield loop under the mutex — inFlightOperations always decreases under the
+        // mutex so the moment it reaches 0 is a stable point.
+        while (true) {
+            val drained = simulatorMutex.withLock {
+                if (inFlightOperations == 0) true else {
+                    false
+                }
+            }
+            if (drained) return
+            yield()
+        }
     }
 
     // ------------------------------------------------------------------ run ownership
@@ -259,60 +437,174 @@ object RealitySimulator {
      * Activated from Base Reality: deep-copy checkpoints the full player state, snapshots the
      * session table into [simSessions], and starts an exact parallel copy of the game on that
      * temporary state. [activeSlot] is the character/save slot this run is bound to.
+     *
+     * The player + session snapshot is taken atomically under [playerMutex] (via
+     * [PlayerRepository.withLock]) so a concurrent Base Reality update cannot race between
+     * the two reads and produce a mixed old/new starting state.
      */
     suspend fun enterSimulation(
         playerRepository: PlayerRepository,
         sessionRepository: SessionRepository,
         activeSlot: Int,
     ) {
-        if (isSimulationActive) return
-        // No valid originating character/save slot: nothing may be bound to, so the run is
-        // rejected before any temporary state is created.
-        if (activeSlot <= 0) {
-            invalidateRun(playerRepository)
-            return
+        // Serialize concurrent enterSimulation calls so two coroutines cannot both pass
+        // the "not active" check and publish two overlapping Layer 2 states. This gate is
+        // only ever acquired by enterSimulation and is never held while any other lock
+        // (simulatorMutex, playerMutex) is held for more than a brief snapshot, so it
+        // cannot create deadlocks. tryLock is used so a second concurrent ENTER is a
+        // no-op (a run is already being set up).
+        if (!entryGate.tryLock()) return
+        try {
+            enterSimulationGuarded(playerRepository, sessionRepository, activeSlot)
+        } finally {
+            entryGate.unlock()
         }
-        val player = try { playerRepository.getOrCreatePlayer() } catch (_: Exception) { null }
-        val flags: PlayerFlags? = try {
-            player?.let { json.decodeFromString<PlayerFlags>(it.flags) }
-        } catch (_: Exception) { null }
-        if (player == null || flags == null) {
-            // Missing or corrupt player data: fail safely rather than start a run that could
-            // not be checkpointed ("An unexpected error occurred. Returning to Base Reality.").
-            discardRun(playerRepository)
+    }
+
+    private suspend fun enterSimulationGuarded(
+        playerRepository: PlayerRepository,
+        sessionRepository: SessionRepository,
+        activeSlot: Int,
+    ) {
+        // Phase 1: take simulatorMutex and check we can enter.
+        simulatorMutex.withLock {
+            if (isSimulationActive) return
+            if (activeSlot <= 0) {
+                _runInvalidated.value = true
+                _phase.value = Phase.BASE_REALITY
+                return
+            }
+        }
+
+        // Phase 2: drain any in-flight operations. With entryGate held, no other
+        // enterSimulation can sneak in. Draining ensures no prior boundary op is
+        // mid-write when we snapshot.
+        awaitDrainInFlight()
+
+        lateinit var playerSnapshot: Player
+        lateinit var sessionSnapshot: List<SkillSession>
+        var flagsSnapshot: PlayerFlags? = null
+        var snapshotOk = true
+        try {
+            // Atomic snapshot: hold playerRepository.withLock { ... } (which takes
+            // playerMutex) and read both player (via getOrCreatePlayerUnlocked, which
+            // bypasses the boundary to avoid re-acquiring simulatorMutex) and sessions
+            // (via getAllSessionsDirect which also bypasses the boundary and hits the
+            // real DAO directly since isSimulationActive is still false). Session writes
+            // from other repository methods do not take playerMutex, but:
+            //   * sim ops can't run (isSimulationActive is false + drained)
+            //   * base-reality session writes do happen via withSimulatorBoundary (which
+            //     routes to real DAO), but those ops are infrequent (alarm-triggered
+            //     completions, watchdog ticks, queued starts) and their effect on the
+            //     snapshot is acceptable as an edge case equivalent to a write just
+            //     before the player tapped Enter Simulator.
+            playerRepository.withLock {
+                val p = playerRepository.getOrCreatePlayerUnlocked()
+                val f: PlayerFlags? = try { json.decodeFromString<PlayerFlags>(p.flags) } catch (_: Exception) { null }
+                if (f == null) { snapshotOk = false; return@withLock }
+                playerSnapshot = p.copy()
+                flagsSnapshot = f
+                sessionSnapshot = try { sessionRepository.getAllSessionsDirect() } catch (_: Exception) { emptyList() }
+            }
+        } catch (_: Exception) {
+            snapshotOk = false
+        }
+
+        if (!snapshotOk || flagsSnapshot == null) {
             _crashedLastRun.value = true
             return
         }
-        // Player is a flat data class of immutable JSON columns: copy() is a full deep copy.
-        checkpoint = player.copy()
-        _simPlayer.value = player.copy()
-        fastForwardSessionId = null
-        fastForwardCursor = 0
-        _lastSkipResult.value = null
-        _runInvalidated.value = false
-        originSlot = activeSlot
-        // Read the real session table while isolation is still off, so the parallel run starts
-        // from exactly the Base Reality session state (player, combat, boss, and every worker
-        // slot — active and completed) and can never write back to it.
-        val sessionSnapshot: List<SkillSession> = try {
-            sessionRepository.getAllSessions()
-        } catch (_: Exception) {
-            emptyList()
+
+        val flags = flagsSnapshot!!
+        val player = playerSnapshot
+
+        // Crash marker — a Base Reality write (isSimulationActive still false).
+        try {
+            playerRepository.updateFlags(flags.copy(simRunActiveSince = System.currentTimeMillis()))
+        } catch (_: Exception) { /* continue even if we couldn't stamp */ }
+
+        // Phase 3: re-acquire simulatorMutex, re-verify, publish. With entryGate held
+        // across this whole method, no other enterSimulation could have published.
+        // Re-verify isSimulationActive as a defence against direct forced teardown
+        // (recoverFromCrash / discardRun) that might have flipped state while we were
+        // snapshotting — if a forced teardown happened, abort the entry cleanly.
+        simulatorMutex.withLock {
+            if (isSimulationActive) return
+            checkpoint = player.copy()
+            _simPlayer.value = player.copy()
+            fastForwardSessionId = null
+            fastForwardCursor = 0
+            _lastSkipResult.value = null
+            _runInvalidated.value = false
+            originSlot = activeSlot
+            generation += 1
+            activeGeneration = generation
+            isSimulationActive = true
+            _simSessions.value = sessionSnapshot
+            _phase.value = Phase.IN_SIMULATION
         }
-        // Crash marker written to Base Reality before isolation activates, so a
-        // force-close during the simulation is detected on the next launch.
-        playerRepository.updateFlags(flags.copy(simRunActiveSince = System.currentTimeMillis()))
-        isSimulationActive = true
-        // Published after activation so session observers switch to the isolated table with the
-        // snapshot already in place.
-        _simSessions.value = sessionSnapshot
-        _phase.value = Phase.IN_SIMULATION
     }
 
     /**
-     * On death or voluntary exit: discard the temporary session state and return to Base
-     * Reality. The run's gains become the pick-3 reward pool. [activeSlot] must still be the
-     * character/save slot the run started from, otherwise no rewards may be offered.
+     * Internal transition from IN_SIMULATION to REWARD_SELECTION on player death.
+     *
+     * Ordering:
+     *   1. Under simulatorMutex: flip isSimulationActive = false (stop admitting new sim
+     *      ops), but DO NOT clear checkpoint / _simPlayer / _simSessions / originSlot yet.
+     *      Reward selection needs that state to compute rewardPool() and apply rewards.
+     *   2. Drain in-flight ops while state is alive.
+     *   3. Clear the crash marker for THIS generation (owns the marker iff originSlot/
+     *      activeGeneration still match). Move to REWARD_SELECTION; checkpoint / simPlayer
+     *      / simSessions remain set until claimRewards/abort clears them.
+     */
+    private suspend fun exitSimulationInternal(
+        playerRepository: PlayerRepository,
+        sessionRepository: SessionRepository,
+        activeSlot: Int,
+    ) {
+        data class ExitInfo(val runGeneration: Long, val owned: Boolean)
+        var earlyReturn = false
+        val info: ExitInfo? = simulatorMutex.withLock {
+            if (!isSimulationActive) { earlyReturn = true; null }
+            else {
+                val o = ownsRun(activeSlot)
+                isSimulationActive = false
+                ExitInfo(activeGeneration, o)
+            }
+        }
+        if (earlyReturn) return
+        awaitDrainInFlight()
+        if (!info!!.owned) {
+            invalidateRun(playerRepository)
+            return
+        }
+        clearCrashMarkerIfOwned(playerRepository, info.runGeneration)
+        _phase.value = Phase.REWARD_SELECTION
+    }
+
+    /**
+     * Clear the Base Reality crash marker only if the current activeGeneration matches
+     * [ownedByGeneration]. This prevents an old death/abort/recovery from clearing a
+     * newer run's crash marker (e.g. when a new run is started after a crash recovery).
+     */
+    private suspend fun clearCrashMarkerIfOwned(playerRepository: PlayerRepository, ownedByGeneration: Long) {
+        try {
+            val flags = playerRepository.getFlags()
+            if (flags.simRunActiveSince <= 0L) return
+            // Only clear if the run we're tearing down is still the one that set the marker
+            // (activeGeneration hasn't advanced to a new run since we captured ownedByGeneration).
+            if (activeGeneration != ownedByGeneration) return
+            playerRepository.updateFlags(flags.copy(simRunActiveSince = 0L))
+        } catch (_: Exception) { /* never block teardown for a marker clear */ }
+    }
+
+    /**
+     * Voluntary/manual exit from Layer 2.  This is NO LONGER a valid gameplay transition:
+     * Layer 2 ends only when the simulated player dies.  Public API retained for internal
+     * callers (crash-recovery tests, legacy call sites that are now no-ops during normal
+     * play); the call is ignored while a normal simulation is active.
+     *
+     * Death is the only controlled way out and is handled by [acknowledgeDeath].
      */
     suspend fun exitSimulation(
         playerRepository: PlayerRepository,
@@ -320,20 +612,15 @@ object RealitySimulator {
         activeSlot: Int,
         died: Boolean = false,
     ) {
-        if (!isSimulationActive) return
-        isSimulationActive = false
-        discardSimulationSessions()
-        // A run whose character/save slot no longer matches must not offer rewards: claiming
-        // them would apply one character's gains to another character's save.
-        if (!ownsRun(activeSlot)) {
-            invalidateRun(playerRepository)
-            return
-        }
-        clearCrashMarker(playerRepository)
-        _phase.value = Phase.REWARD_SELECTION
+        // Only the death path is permitted to end Layer 2.  Voluntary/manual calls (which
+        // historically passed died = false, the default) are silently ignored so there is no
+        // normal-gameplay exit path.  Internal forced teardown (crash, invalidation,
+        // recovery) uses discardRun / invalidateRun / recoverFromCrash directly.
+        if (!died) return
+        exitSimulationInternal(playerRepository, sessionRepository, activeSlot)
     }
 
-    /** Discards the run without rewards (used when the reward pool is empty). */
+    /** Discards the run without rewards (used when the reward pool is empty or from crash paths). */
     suspend fun abortToBaseReality(
         playerRepository: PlayerRepository,
         sessionRepository: SessionRepository,
@@ -353,29 +640,79 @@ object RealitySimulator {
         fastForwardCursor = 0
     }
 
-    /**
-     * Drops every piece of temporary simulation state and clears the Base Reality crash marker.
-     * The real save keeps exactly the state it had before the run started — no stale simulated
-     * value is ever restored over it.
-     */
-    private suspend fun discardRun(playerRepository: PlayerRepository) {
-        isSimulationActive = false
-        checkpoint = null
-        _simPlayer.value = null
-        discardSimulationSessions()
-        originSlot = 0
-        clearCrashMarker(playerRepository)
-        _phase.value = Phase.BASE_REALITY
+    private fun discardSimulationSessionsLocked() {
+        _simSessions.value = emptyList()
+        fastForwardSessionId = null
+        fastForwardCursor = 0
     }
 
     /**
-     * Rejects a Simulator operation whose character/save slot no longer matches the run's
-     * originating one: the temporary state is discarded and the run is reported invalid
-     * ("Simulation is no longer valid. Returning to Base Reality.").
+     * Forced teardown (crash recovery, invalidation, abort, reward-skip). Flip inactive,
+     * drain, then clear state. Crash marker is cleared only if it still belongs to THIS
+     * generation.
      */
+    private suspend fun discardRun(playerRepository: PlayerRepository) {
+        val runGeneration = simulatorMutex.withLock {
+            isSimulationActive = false
+            _phase.value = Phase.BASE_REALITY
+            activeGeneration
+        }
+        awaitDrainInFlight()
+        simulatorMutex.withLock {
+            if (activeGeneration == runGeneration) {
+                checkpoint = null
+                _simPlayer.value = null
+                discardSimulationSessionsLocked()
+                originSlot = 0
+                activeGeneration = 0L
+            }
+        }
+        clearCrashMarkerIfOwned(playerRepository, runGeneration)
+    }
+
+    /**
+     * Forced teardown callable FROM INSIDE a pinned-to-sim op (e.g. timeSkip detects
+     * corruption). Flips isSimulationActive=false under the mutex so no new boundary can
+     * pin to sim, but does NOT clear state here — that has to wait for the caller to
+     * unwind and for drain to finish. We schedule a discard via scope launch so the
+     * final cleanup happens after the in-flight op finishes.
+     */
+    private suspend fun discardRunFromWithinBoundary(playerRepository: PlayerRepository) {
+        val runGeneration = simulatorMutex.withLock {
+            isSimulationActive = false
+            _phase.value = Phase.BASE_REALITY
+            activeGeneration
+        }
+        // Launch the actual cleanup to run AFTER this in-flight op returns (it waits for
+        // in-flight ops to drain). Crash marker is cleared as part of that cleanup.
+        scope.launch {
+            awaitDrainInFlight()
+            simulatorMutex.withLock {
+                if (activeGeneration == runGeneration) {
+                    checkpoint = null
+                    _simPlayer.value = null
+                    discardSimulationSessionsLocked()
+                    originSlot = 0
+                    activeGeneration = 0L
+                }
+            }
+            clearCrashMarkerIfOwned(playerRepository, runGeneration)
+        }
+    }
+
     private suspend fun invalidateRun(playerRepository: PlayerRepository) {
         discardRun(playerRepository)
         _runInvalidated.value = true
+    }
+
+    private suspend fun invalidateRunFromWithinBoundary(playerRepository: PlayerRepository) {
+        discardRunFromWithinBoundary(playerRepository)
+        _runInvalidated.value = true
+    }
+
+    /** Skip rewards: same discard path used after reward selection is abandoned/aborted. */
+    suspend fun skipRewards(playerRepository: PlayerRepository) {
+        discardRun(playerRepository)
     }
 
     // ------------------------------------------------------------------ Fast Time Simulation
@@ -413,11 +750,11 @@ object RealitySimulator {
         boostRepository: BoostRepository,
         minutes: Int,
         activeSlot: Int,
-    ): TimeSkipResult {
-        if (!isSimulationActive) return TimeSkipResult()
+    ): TimeSkipResult = withSimulatorBoundary {
+        if (!isSimulationActive) return@withSimulatorBoundary TimeSkipResult()
         if (!ownsRun(activeSlot)) {
-            invalidateRun(playerRepository)
-            return TimeSkipResult()
+            invalidateRunFromWithinBoundary(playerRepository)
+            return@withSimulatorBoundary TimeSkipResult()
         }
         val session = try {
             sessionRepository.getActiveSession()
@@ -425,25 +762,25 @@ object RealitySimulator {
             null
         }
         // No action running inside the simulation: nothing to advance (not an error).
-        if (session == null) return TimeSkipResult()
+        if (session == null) return@withSimulatorBoundary TimeSkipResult()
         val frames: List<SessionFrame> = try {
             json.decodeFromString(session.frames)
         } catch (_: Exception) {
             // Corrupt frame data: discard only the temporary state and report the error.
-            discardRun(playerRepository)
+            discardRunFromWithinBoundary(playerRepository)
             _crashedLastRun.value = true
-            return TimeSkipResult()
+            return@withSimulatorBoundary TimeSkipResult()
         }
         // A zero-duration session has no frames to advance; that is not an error.
-        if (frames.isEmpty()) return TimeSkipResult()
+        if (frames.isEmpty()) return@withSimulatorBoundary TimeSkipResult()
         if (fastForwardSessionId != session.sessionId) {
             fastForwardSessionId = session.sessionId
             fastForwardCursor = 0
         }
         val from = fastForwardCursor.coerceIn(0, frames.size)
-        if (from >= frames.size) return TimeSkipResult()
+        if (from >= frames.size) return@withSimulatorBoundary TimeSkipResult()
         val to = (from + minutes.coerceAtLeast(0)).coerceAtMost(frames.size)
-        if (to <= from) return TimeSkipResult()
+        if (to <= from) return@withSimulatorBoundary TimeSkipResult()
 
         val slice = frames.subList(from, to)
         // Death inside the skip ends the run at the death minute.
@@ -548,9 +885,9 @@ object RealitySimulator {
             if (reachedEnd || died) sessionRepository.markCompleted(session.sessionId)
         } catch (_: Exception) {
             // Missing or corrupt session state: discard only the temporary state and report it.
-            discardRun(playerRepository)
+            discardRunFromWithinBoundary(playerRepository)
             _crashedLastRun.value = true
-            return TimeSkipResult()
+            return@withSimulatorBoundary TimeSkipResult()
         }
 
         val result = TimeSkipResult(
@@ -566,7 +903,7 @@ object RealitySimulator {
         fastForwardCursor = from + consumed.size
         _lastSkipResult.value = result
         _phase.value = if (died) Phase.SIM_DEATH else Phase.TIME_SKIP_RESULT
-        return result
+        result
     }
 
     /** Arrow/rune reclaim chance per level — the same curve the collect path uses. */
@@ -628,33 +965,42 @@ object RealitySimulator {
 
     /**
      * Applies up to [MAX_REWARDS] selected rewards to Base Reality and finishes the
-     * return. Anything not selected is discarded with the temporary state.
-     *
-     * Rewards go only to the character/save slot that started the run ([activeSlot] must still
-     * match [ownsRun]), and only once: the claim is serialized on [claimMutex] and clears the
-     * checkpoint it pays out from, so a second or concurrent claim finds nothing left to apply.
-     * Returns true when this call completed the return to Base Reality.
+     * return. Accepts any [Iterable] of [SimReward] so callers can pass either a List
+     * (from rewardPool filtering) or a Set (from UI toggle state). Anything not selected
+     * is discarded with the temporary state.
      */
     suspend fun claimRewards(
         playerRepository: PlayerRepository,
-        selected: List<SimReward>,
+        selected: Iterable<SimReward>,
         activeSlot: Int,
     ): Boolean = claimMutex.withLock {
-        // Claiming while a run is still active would apply rewards to the temporary state.
-        if (isSimulationActive) return@withLock false
-        val base = checkpoint
-        val sim = _simPlayer.value
-        if (base == null || sim == null) {
-            // Nothing left to claim (already claimed, or the run was discarded): finish the
-            // return without applying anything a second time.
-            discardRun(playerRepository)
-            return@withLock true
+        data class ClaimSnapshot(val runGeneration: Long, val owned: Boolean, val base: Player, val sim: Player)
+        var earlyReturn: Boolean? = null
+        val snap: ClaimSnapshot? = simulatorMutex.withLock {
+            if (isSimulationActive) { earlyReturn = false; null }
+            else {
+                val b = checkpoint
+                val s = _simPlayer.value
+                if (b == null || s == null) { earlyReturn = true; null }
+                else ClaimSnapshot(
+                    runGeneration = activeGeneration,
+                    owned = ownsRun(activeSlot),
+                    base = b,
+                    sim = s,
+                )
+            }
         }
-        // Not the character/save slot this run belongs to: no reward may cross characters.
-        if (!ownsRun(activeSlot)) {
+        if (earlyReturn != null) {
+            if (earlyReturn == true) discardRun(playerRepository)
+            return@withLock earlyReturn == true
+        }
+        if (!snap!!.owned) {
             invalidateRun(playerRepository)
             return@withLock false
         }
+        val runGeneration = snap.runGeneration
+        val base = snap.base
+        val sim = snap.sim
         val checkpointXp: Map<String, Long> = try {
             json.decodeFromString(base.skillXp)
         } catch (_: Exception) {
@@ -698,16 +1044,23 @@ object RealitySimulator {
                 }
             }
         } catch (_: Exception) {
-            // A failed claim must not stay claimable: discard the run and report the error.
             discardRun(playerRepository)
             _crashedLastRun.value = true
             return@withLock false
         }
-        checkpoint = null
-        _simPlayer.value = null
-        discardSimulationSessions()
-        originSlot = 0
-        _phase.value = Phase.BASE_REALITY
+        // Drain any late in-flight ops before clearing sim state.
+        awaitDrainInFlight()
+        simulatorMutex.withLock {
+            if (activeGeneration == runGeneration) {
+                checkpoint = null
+                _simPlayer.value = null
+                discardSimulationSessionsLocked()
+                originSlot = 0
+                activeGeneration = 0L
+            }
+            _phase.value = Phase.BASE_REALITY
+        }
+        clearCrashMarkerIfOwned(playerRepository, runGeneration)
         true
     }
 
@@ -734,33 +1087,23 @@ object RealitySimulator {
         playerRepository: PlayerRepository,
         sessionRepository: SessionRepository,
     ) {
-        // Discard the temporary simulation state first so flag reads below always
-        // come from the real save (this may run mid-process or at next app start).
-        isSimulationActive = false
-        _simPlayer.value = null
-        checkpoint = null
-        discardSimulationSessions()
-        originSlot = 0
-        _phase.value = Phase.BASE_REALITY
-        val flags = try { playerRepository.getFlags() } catch (_: Exception) { null } ?: return
-        if (flags.simRunActiveSince <= 0L) return
-        try {
-            playerRepository.updateFlags(flags.copy(simRunActiveSince = 0L))
-        } catch (_: Exception) {
-            // Recovery must never crash the app.
+        val runGeneration = simulatorMutex.withLock {
+            isSimulationActive = false
+            _phase.value = Phase.BASE_REALITY
+            activeGeneration
         }
-        _crashedLastRun.value = true
-    }
-
-    private suspend fun clearCrashMarker(playerRepository: PlayerRepository) {
-        try {
-            val flags = playerRepository.getFlags()
-            if (flags.simRunActiveSince > 0L) {
-                playerRepository.updateFlags(flags.copy(simRunActiveSince = 0L))
+        awaitDrainInFlight()
+        simulatorMutex.withLock {
+            if (activeGeneration == runGeneration) {
+                _simPlayer.value = null
+                checkpoint = null
+                discardSimulationSessionsLocked()
+                originSlot = 0
+                activeGeneration = 0L
             }
-        } catch (_: Exception) {
-            // Clearing the marker must never block a return to Base Reality.
         }
+        clearCrashMarkerIfOwned(playerRepository, runGeneration)
+        _crashedLastRun.value = true
     }
 
     /** Consumes the crashed-last-run notice so it is shown once. */
@@ -787,7 +1130,11 @@ object RealitySimulator {
         _phase.value = if (isSimulationActive) Phase.IN_SIMULATION else Phase.REWARD_SELECTION
     }
 
-    /** Death in the Simulator: discard temp state and move on to reward selection. */
+    /**
+     * Death in the Simulator: this is the sole normal-gameplay transition out of Layer 2.
+     * Drains all in-flight session/player operations (they continue to write into sim state),
+     * then deactivates isolation and moves to reward selection.
+     */
     suspend fun acknowledgeDeath(
         playerRepository: PlayerRepository,
         sessionRepository: SessionRepository,
