@@ -874,7 +874,7 @@ object RealitySimulator {
         discardSimulationSessions()
         originSlot = 0
         _phase.value = Phase.BASE_REALITY
-        true
+        return true
     }
 
     // ------------------------------------------------------------------ crash recovery
