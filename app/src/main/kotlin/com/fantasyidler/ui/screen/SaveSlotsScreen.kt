@@ -91,6 +91,12 @@ fun SaveSlotsScreen(
             AppBannerCenter.enqueue(context.getString(R.string.save_slot_switch_failed))
         }
     }
+    LaunchedEffect(state.switchBlockedBySimulation) {
+        if (state.switchBlockedBySimulation) {
+            viewModel.switchBlockedConsumed()
+            AppBannerCenter.enqueue(context.getString(R.string.simulator_switch_blocked))
+        }
+    }
 
     createSlot?.let { slot ->
         AlertDialog(

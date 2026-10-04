@@ -353,6 +353,9 @@ class SessionRepository @Inject constructor(
 
     suspend fun getSession(sessionId: String): SkillSession? = sessionDao.getSession(sessionId)
 
+    /** Every stored session: active and completed, player and both worker slots. */
+    suspend fun getAllSessions(): List<SkillSession> = sessionDao.getAllSessions()
+
     suspend fun abandonSession(sessionId: String) {
         cancelAlarm(sessionId)
         sessionDao.delete(sessionId)

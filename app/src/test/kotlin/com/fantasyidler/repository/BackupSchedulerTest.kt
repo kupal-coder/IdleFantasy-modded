@@ -15,6 +15,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.fantasyidler.data.db.AppDatabase
 import com.fantasyidler.data.model.PlayerExport
 import com.fantasyidler.data.model.PlayerFlags
+import com.fantasyidler.simulator.RealitySimulator
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import org.junit.After
@@ -81,6 +82,8 @@ class BackupSchedulerTest {
 
     @After
     fun tearDown() {
+        // RealitySimulator is a process-wide singleton: never leave a run active for other tests.
+        runBlocking { RealitySimulator.abortToBaseReality(playerRepo, sessionRepo) }
         db.close()
     }
 
@@ -280,6 +283,24 @@ class BackupSchedulerTest {
         val flags = playerRepo.getFlags()
         assertTrue(flags.lastBackupOk)
         assertEquals(0L, flags.lastBackupAt)
+    }
+
+    @Test
+    fun `a backup firing during a simulation returns false without touching provider`() = runBlocking {
+        // A run's state is temporary: an alarm firing mid-run must not persist simulated values
+        // as this character's backup, or restoring that file would overwrite Base Reality.
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+
+        val ok = scheduler.performBackup(playerRepo)
+
+        assertFalse(ok)
+        assertTrue(docs.events.isEmpty())
+        assertTrue(docs.createdUris.isEmpty())
+
+        // Outside the run the very same backup succeeds again.
+        RealitySimulator.abortToBaseReality(playerRepo, sessionRepo)
+        assertTrue(scheduler.performBackup(playerRepo))
+        assertEquals(1, docs.createdUris.size)
     }
 
     private fun treeUriString(): String =
