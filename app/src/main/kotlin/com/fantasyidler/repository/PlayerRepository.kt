@@ -1563,13 +1563,13 @@ class PlayerRepository @Inject constructor(
      * pet keys were absent from pets.json. Moves any matching inventory items into
      * the OwnedPet list and removes them from inventory.
      */
-    suspend fun migratePetsFromInventory(petKeys: Set<String>) {
+    suspend fun migratePetsFromInventory(petKeys: Set<String>) = playerMutex.withLock {
         val player = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
         val pets: MutableList<OwnedPet> = json.decodeFromString(player.pets)
         val ownedIds = pets.map { it.id }.toSet()
         val toMigrate = petKeys.filter { it in inventory && it !in ownedIds }
-        if (toMigrate.isEmpty()) return
+        if (toMigrate.isEmpty()) return@withLock
         toMigrate.forEach { key ->
             inventory.remove(key)
             pets.add(OwnedPet(id = key, boostPercent = 0))
@@ -1604,19 +1604,19 @@ class PlayerRepository @Inject constructor(
     suspend fun consumeMaterials(
         materialsPerItem: Map<String, Int>,
         quantity: Int,
-    ): Boolean {
+    ): Boolean = playerMutex.withLock {
         val player    = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
 
         for ((item, needed) in materialsPerItem) {
-            if ((inventory[item] ?: 0) < needed * quantity) return false
+            if ((inventory[item] ?: 0) < needed * quantity) return@withLock false
         }
         for ((item, needed) in materialsPerItem) {
             val remaining = (inventory[item] ?: 0) - needed * quantity
             if (remaining <= 0) inventory.remove(item) else inventory[item] = remaining
         }
         playerDao.upsert(player.copy(inventory = json.encode<Map<String, Int>>(inventory)))
-        return true
+        return@withLock true
     }
 
     /** Returns a JSON string capturing the full player save including quest progress and sessions. */
@@ -1651,35 +1651,44 @@ class PlayerRepository @Inject constructor(
         // importing another character invalidates the run, so its rewards can never be claimed
         // onto a different save. Must run before the import — afterwards the import's own
         // writes would land in the temporary simulation state instead of Base Reality.
-        RealitySimulator.invalidateRunForReplacement()
-        return playerMutex.withLock {
-            var export = json.decodeFromString<PlayerExport>(stripJsonGarbage(jsonString))
-            var ironmanDemoted = false
-            val importedFlags = try { json.decodeFromString<PlayerFlags>(export.flags) } catch (_: Exception) { null }
-            if (importedFlags?.ironman == true && export.sig != saveSignature(export)) {
-                export = export.copy(flags = json.encode<PlayerFlags>(importedFlags.copy(ironman = false)))
-                ironmanDemoted = true
-            }
-            appDatabase.withTransaction {
-                val player = getOrCreatePlayer()
-                playerDao.upsert(
-                    player.copy(
-                        skillLevels = export.skillLevels,
-                        skillXp     = export.skillXp,
-                        inventory   = export.inventory,
-                        equipped    = export.equipped,
-                        flags       = export.flags,
-                        pets        = export.pets,
-                        coins       = export.coins,
-                    )
-                )
-                questProgressDao.deleteAll()
-                export.questProgress.forEach { questProgressDao.upsert(it) }
-                farmingPatchDao.clearAll()
-                export.farmingPatches.forEach { farmingPatchDao.upsert(it) }
-            }
-            ImportedSave(export, ironmanDemoted)
+        RealitySimulator.invalidateRunForReplacement(this)
+        return playerMutex.withLock { importSaveUnlocked(jsonString) }
+    }
+
+    /**
+     * [importSave] for a caller that already owns the routing scope: [RealitySimulator]'s
+     * lifecycle gate (so no run can start mid-import) and [playerMutex], which the caller takes
+     * with [withLock] in that order — simulatorMutex -> playerMutex, never the reverse. The
+     * invalidation is skipped because a caller holding the gate has already established that no
+     * run is active, and the gate is not reentrant.
+     */
+    internal suspend fun importSaveUnlocked(jsonString: String): ImportedSave {
+        var export = json.decodeFromString<PlayerExport>(stripJsonGarbage(jsonString))
+        var ironmanDemoted = false
+        val importedFlags = try { json.decodeFromString<PlayerFlags>(export.flags) } catch (_: Exception) { null }
+        if (importedFlags?.ironman == true && export.sig != saveSignature(export)) {
+            export = export.copy(flags = json.encode<PlayerFlags>(importedFlags.copy(ironman = false)))
+            ironmanDemoted = true
         }
+        appDatabase.withTransaction {
+            val player = getOrCreatePlayer()
+            playerDao.upsert(
+                player.copy(
+                    skillLevels = export.skillLevels,
+                    skillXp     = export.skillXp,
+                    inventory   = export.inventory,
+                    equipped    = export.equipped,
+                    flags       = export.flags,
+                    pets        = export.pets,
+                    coins       = export.coins,
+                )
+            )
+            questProgressDao.deleteAll()
+            export.questProgress.forEach { questProgressDao.upsert(it) }
+            farmingPatchDao.clearAll()
+            export.farmingPatches.forEach { farmingPatchDao.upsert(it) }
+        }
+        return ImportedSave(export, ironmanDemoted)
     }
 
     /**
@@ -1721,7 +1730,12 @@ class PlayerRepository @Inject constructor(
     suspend fun resetProgression(ironman: Boolean = false) {
         // Same rule as [importSave]: resetting replaces the character a Simulator run was
         // checkpointed from, so the run and its claimable rewards die with it.
-        RealitySimulator.invalidateRunForReplacement()
+        RealitySimulator.invalidateRunForReplacement(this)
+        playerMutex.withLock { resetProgressionUnlocked(ironman) }
+    }
+
+    /** [resetProgression] for a caller that already holds [playerMutex] (see [importSaveUnlocked]). */
+    internal suspend fun resetProgressionUnlocked(ironman: Boolean = false) {
         val previousFlags = playerDao.getPlayer()?.let { player ->
             try { json.decodeFromString<PlayerFlags>(player.flags) } catch (_: Exception) { null }
         }
@@ -1931,7 +1945,7 @@ class PlayerRepository @Inject constructor(
 
 
     /** Seeds seenItemKeys from current inventory + equipped; always ensures starting items are present. */
-    suspend fun migrateSeenItems() {
+    suspend fun migrateSeenItems() = playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val startingItems = setOf("bronze_pickaxe", "bronze_axe", "bronze_fishing_rod", "bronze_boots")
@@ -1942,7 +1956,7 @@ class PlayerRepository @Inject constructor(
                     flags = json.encode<PlayerFlags>(flags.copy(seenItemKeys = flags.seenItemKeys + missing))
                 ))
             }
-            return
+            return@withLock
         }
         val inventory: Map<String, Int> = json.decodeFromString(player.inventory)
         val equipped: Map<String, String?> = json.decodeFromString(player.equipped)

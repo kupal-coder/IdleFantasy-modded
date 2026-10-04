@@ -239,20 +239,27 @@ class SimulatorViewModel @Inject constructor(
 
     // ------------------------------------------------------------------ upgrades (Base Reality)
 
+    /**
+     * Upgrades are bought in Base Reality, so the "no run active" check and the purchase have
+     * to be one lifecycle operation: otherwise a run starting in between would take the coins
+     * from the real save and write the upgrade into the simulation, losing both.
+     */
     fun buyUpgrade(upgradeKey: String) {
         viewModelScope.launch {
             try {
-                if (RealitySimulator.isSimulationActive) return@launch
-                val flags = playerRepo.getFlags()
-                val level = RealitySimulator.upgradeLevel(flags, upgradeKey)
-                val cost = RealitySimulator.upgradeCost(upgradeKey, level)
-                if (cost < 0L) return@launch
-                if (!playerRepo.spendCoins(cost)) {
-                    _extra.update { it.copy(message = context.withAppLocale().getString(R.string.simulator_upgrade_not_enough_coins)) }
-                    return@launch
+                val message = RealitySimulator.withSimulatorLock<String?> {
+                    if (RealitySimulator.isSimulationActive) return@withSimulatorLock null
+                    val flags = playerRepo.getFlags()
+                    val level = RealitySimulator.upgradeLevel(flags, upgradeKey)
+                    val cost = RealitySimulator.upgradeCost(upgradeKey, level)
+                    if (cost < 0L) return@withSimulatorLock null
+                    if (!playerRepo.spendCoins(cost)) {
+                        return@withSimulatorLock context.withAppLocale().getString(R.string.simulator_upgrade_not_enough_coins)
+                    }
+                    playerRepo.updateFlags(flags.copy(simulatorUpgrades = flags.simulatorUpgrades + (upgradeKey to level + 1)))
+                    context.withAppLocale().getString(R.string.simulator_upgrade_purchased)
                 }
-                playerRepo.updateFlags(flags.copy(simulatorUpgrades = flags.simulatorUpgrades + (upgradeKey to level + 1)))
-                _extra.update { it.copy(message = context.withAppLocale().getString(R.string.simulator_upgrade_purchased)) }
+                if (message != null) _extra.update { it.copy(message = message) }
             } catch (e: Exception) {
                 abortWithCrashMessage()
             }

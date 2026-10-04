@@ -60,6 +60,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Provider
 
@@ -121,25 +122,7 @@ class SimulatorIsolationTest {
         )
         sessionRepo = SessionRepository(sessionDao, context, json, gameData, playerDao, playerRepo)
         globalStateRepo = GlobalStateRepository(db.globalStateDao())
-        val backupScheduler = BackupScheduler(context, sessionRepo, globalStateRepo)
-        val questRepo = QuestRepository(db.questProgressDao(), gameData)
-        val townRepo = TownRepository(gameData, playerRepo, questRepo, boostRepo)
-        val mercRepo = MercenaryRepository(playerRepo, gameData)
-        val queuedSessionStarter = QueuedSessionStarter(
-            boostRepo, context, playerRepo, sessionRepo, townRepo, gameData, mercRepo, json,
-        )
-        val workerStarter = WorkerQueuedSessionStarter(boostRepo, playerRepo, sessionRepo, gameData, json)
-        val seasonalEventRepo = SeasonalEventRepository(playerRepo, gameData, dailyQuestRepo, context)
-        val farmingRepo = FarmingRepository(
-            context, db, db.farmingPatchDao(), playerRepo, gameData,
-            seasonalEventRepo, globalStateRepo, json, boostRepo,
-        )
-        val guildRepo = GuildRepository(playerRepo, db.questProgressDao(), gameData, Provider { townRepo })
-        saveSlotRepo = SaveSlotRepository(
-            context, playerRepo, sessionRepo, questRepo, farmingRepo, guildRepo,
-            globalStateRepo, queuedSessionStarter, workerStarter, backupScheduler,
-            buffNotifScheduler, json,
-        )
+        saveSlotRepo = saveSlotRepositoryOver(playerRepo, sessionRepo)
         runBlocking {
             globalStateRepo.setActiveSaveSlot(1)
             playerRepo.getOrCreatePlayer()
@@ -994,6 +977,158 @@ class SimulatorIsolationTest {
         assertBaseRealityUnchanged(realBefore)
     }
 
+    // ------------------------------------------------------------------ lifecycle transition races
+    //
+    // Each of these parks an operation between resolving its routing target and performing its
+    // write, starts the competing lifecycle transition, and only then releases the write. The
+    // interleaving is forced, not raced: nothing sleeps, and the assertions hold on any scheduler.
+
+    @Test
+    fun `a gameplay write cannot reach base reality while the run is exiting`() = runBlocking {
+        seedBaseReality()
+        val realBefore = realPlayerDao.getPlayer()!!
+        val armed = AtomicBoolean(false)
+        val gate = CompletableDeferred<Unit>()
+        val insideRead = CompletableDeferred<Unit>()
+        val gatedPlayerRepo = gatedPlayerRepository(armed, insideRead, readGate = gate)
+
+        RealitySimulator.enterSimulation(gatedPlayerRepo, sessionRepo, 1)
+        assertTrue(RealitySimulator.isSimulationActive)
+
+        // Normal gameplay inside the run: it reads the simulated player and is then parked
+        // before its write, still holding the operation scope the routing switch must respect.
+        armed.set(true)
+        val gameplay = async { gatedPlayerRepo.addCoins(500) }
+        insideRead.await()
+
+        // Exit starts while that operation is open. UNDISPATCHED runs it up to the point where
+        // it can no longer progress, so the routing switch either already happened (bug) or is
+        // waiting for the gameplay operation to finish (fixed).
+        val exit = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.exitSimulation(gatedPlayerRepo, sessionRepo, 1)
+        }
+        gate.complete(Unit)
+        gameplay.await()
+        exit.await()
+
+        // The 500 coins belonged to the simulation: Base Reality is exactly as it was.
+        assertBaseRealityUnchanged(realBefore)
+        assertEquals(1_000L, realPlayerDao.getPlayer()!!.coins)
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+    }
+
+    @Test
+    fun `an import cannot overlap with a simulation starting`() = runBlocking {
+        seedBaseReality()                              // character A
+        val characterA = playerRepo.exportSave(emptyList())
+        playerRepo.resetProgression()                  // character B: a fresh character
+        val characterB = playerRepo.exportSave(emptyList())
+        playerRepo.importSave(characterA)
+        val aCoins = json.decodeFromString<PlayerExport>(characterA).coins
+        val bCoins = json.decodeFromString<PlayerExport>(characterB).coins
+        assertTrue("the two characters must differ for this test to mean anything", aCoins != bCoins)
+
+        val armed = AtomicBoolean(false)
+        val gate = CompletableDeferred<Unit>()
+        val insideWrite = CompletableDeferred<Unit>()
+        val gatedPlayerRepo = gatedPlayerRepository(armed, insideWrite, writeGate = gate)
+        val gatedSaveSlotRepo = saveSlotRepositoryOver(gatedPlayerRepo, sessionRepo)
+
+        // Import B, parked inside the write that replaces the character.
+        armed.set(true)
+        val import = async { gatedSaveSlotRepo.importFullSave(characterB) }
+        insideWrite.await()
+        val enter = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.enterSimulation(gatedPlayerRepo, sessionRepo, 1)
+        }
+        gate.complete(Unit)
+        import.await()
+        enter.await()
+
+        // The import landed in Base Reality — it was not redirected into simulation state ...
+        assertEquals(bCoins, realPlayerDao.getPlayer()!!.coins)
+        assertNull(realInventory()["iron_ore"])
+        // ... and the run that started was checkpointed from B, not from the character B replaced.
+        assertTrue(RealitySimulator.isSimulationActive)
+        assertEquals(
+            "the run was checkpointed from the character the import replaced",
+            bCoins, RealitySimulator.simPlayer.value!!.coins,
+        )
+        RealitySimulator.abortToBaseReality(gatedPlayerRepo, sessionRepo)
+    }
+
+    @Test
+    fun `a progression reset cannot overlap with a simulation starting`() = runBlocking {
+        seedBaseReality()
+        val armed = AtomicBoolean(false)
+        val gate = CompletableDeferred<Unit>()
+        val insideWrite = CompletableDeferred<Unit>()
+        val gatedPlayerRepo = gatedPlayerRepository(armed, insideWrite, writeGate = gate)
+        val gatedSaveSlotRepo = saveSlotRepositoryOver(gatedPlayerRepo, sessionRepo)
+
+        armed.set(true)
+        val reset = async { gatedSaveSlotRepo.resetProgression() }
+        insideWrite.await()
+        val enter = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.enterSimulation(gatedPlayerRepo, sessionRepo, 1)
+        }
+        gate.complete(Unit)
+        assertTrue(reset.await())
+        enter.await()
+
+        // The reset landed in Base Reality ...
+        assertEquals(0L, realXp()["mining"])
+        assertNull(realInventory()["iron_ore"])
+        // ... and the run was checkpointed from the reset character, not the one it replaced.
+        assertTrue(RealitySimulator.isSimulationActive)
+        assertEquals(
+            "the run was checkpointed from the pre-reset character",
+            0L, RealitySimulator.simPlayer.value!!.coins,
+        )
+        RealitySimulator.abortToBaseReality(gatedPlayerRepo, sessionRepo)
+    }
+
+    @Test
+    fun `a slot switch cannot overlap with a simulation starting`() = runBlocking {
+        seedBaseReality()                              // active slot 1: character A
+        val characterA = playerRepo.exportSave(emptyList())
+        val aCoins = json.decodeFromString<PlayerExport>(characterA).coins
+        // Store A in slot 1 and move to slot 2, so there is a character to switch back to. The
+        // outgoing character is given a coin value A cannot have, so "which character did the
+        // run start from?" is unambiguous whatever slot 2 held before this test.
+        saveSlotRepo.switchTo(2)
+        val outgoingCoins = 424_242L
+        realPlayerDao.upsert(realPlayerDao.getPlayer()!!.copy(coins = outgoingCoins))
+        assertTrue("the outgoing character must differ from A", outgoingCoins != aCoins)
+
+        val armed = AtomicBoolean(false)
+        val gate = CompletableDeferred<Unit>()
+        val insideWrite = CompletableDeferred<Unit>()
+        val gatedPlayerRepo = gatedPlayerRepository(armed, insideWrite, writeGate = gate)
+        val gatedSaveSlotRepo = saveSlotRepositoryOver(gatedPlayerRepo, sessionRepo)
+
+        // Switch back to slot 1 (A), parked inside the write that loads it.
+        armed.set(true)
+        val switch = async { gatedSaveSlotRepo.switchTo(1) }
+        insideWrite.await()
+        val enter = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.enterSimulation(gatedPlayerRepo, sessionRepo, 1)
+        }
+        gate.complete(Unit)
+        switch.await()
+        enter.await()
+
+        // A is loaded again ...
+        assertEquals("the switch did not land in base reality", aCoins, realPlayerDao.getPlayer()!!.coins)
+        // ... and the run was checkpointed from A, not from the outgoing slot-2 character.
+        assertTrue(RealitySimulator.isSimulationActive)
+        assertEquals(
+            "the run was checkpointed from the outgoing character",
+            aCoins, RealitySimulator.simPlayer.value!!.coins,
+        )
+        RealitySimulator.abortToBaseReality(gatedPlayerRepo, sessionRepo)
+    }
+
     // ------------------------------------------------------------------ character / save-slot protection
 
     @Test
@@ -1104,6 +1239,87 @@ class SimulatorIsolationTest {
     /** A [SessionRepository] over an arbitrary [SkillSessionDao], sharing the run's global state. */
     private fun sessionRepositoryOver(sessionDao: SkillSessionDao): SessionRepository =
         SessionRepository(sessionDao, context, json, gameData, SimulationPlayerDao(realPlayerDao), playerRepo)
+
+    /** A [SaveSlotRepository] over an arbitrary player/session repository pair, sharing this run's DB. */
+    private fun saveSlotRepositoryOver(
+        playerRepository: PlayerRepository,
+        sessionRepository: SessionRepository,
+    ): SaveSlotRepository {
+        val backupScheduler = BackupScheduler(context, sessionRepository, globalStateRepo)
+        val questRepo = QuestRepository(db.questProgressDao(), gameData)
+        val townRepo = TownRepository(gameData, playerRepository, questRepo, boostRepo)
+        val mercRepo = MercenaryRepository(playerRepository, gameData)
+        val queuedSessionStarter = QueuedSessionStarter(
+            boostRepo, context, playerRepository, sessionRepository, townRepo, gameData, mercRepo, json,
+        )
+        val workerStarter = WorkerQueuedSessionStarter(boostRepo, playerRepository, sessionRepository, gameData, json)
+        val seasonalEventRepo = SeasonalEventRepository(playerRepository, gameData, DailyQuestRepository(gameData), context)
+        val farmingRepo = FarmingRepository(
+            context, db, db.farmingPatchDao(), playerRepository, gameData,
+            seasonalEventRepo, globalStateRepo, json, boostRepo,
+        )
+        val guildRepo = GuildRepository(playerRepository, db.questProgressDao(), gameData, Provider { townRepo })
+        return SaveSlotRepository(
+            context, playerRepository, sessionRepository, questRepo, farmingRepo, guildRepo,
+            globalStateRepo, queuedSessionStarter, workerStarter, backupScheduler,
+            BuffNotificationScheduler(context), json,
+        )
+    }
+
+    /**
+     * A [PlayerRepository] whose player reads and writes can be parked mid-operation.
+     *
+     * The gated DAO sits OUTSIDE the [SimulationPlayerDao], so it intercepts a call before the
+     * routing decision is taken: parking there holds an operation exactly between "the target
+     * was resolved" and "the write is routed", which is the window these lifecycle races live
+     * in. [readGate] parks the first read and [writeGate] the first write, each once and only
+     * after [armed] is set, so setup work is never parked.
+     *
+     * A test using this opens an operation, starts the competing transition, and only then
+     * releases the gate: the interleaving is forced, not raced, and no test sleeps.
+     */
+    private fun gatedPlayerRepository(
+        armed: AtomicBoolean,
+        inside: CompletableDeferred<Unit>,
+        readGate: CompletableDeferred<Unit>? = null,
+        writeGate: CompletableDeferred<Unit>? = null,
+    ): PlayerRepository {
+        val simDao = SimulationPlayerDao(realPlayerDao)
+        val parkedRead = AtomicBoolean(false)
+        val parkedWrite = AtomicBoolean(false)
+        val gatedDao = object : PlayerDao by simDao {
+            override suspend fun getPlayer(): Player? {
+                // Resolved first: the parked operation is holding the value it is about to
+                // write back, which is what makes an untimely routing switch observable.
+                val routed = simDao.getPlayer()
+                if (armed.get() && readGate != null && !parkedRead.getAndSet(true)) {
+                    inside.complete(Unit)
+                    readGate.await()
+                }
+                return routed
+            }
+
+            override suspend fun upsert(player: Player) {
+                if (armed.get() && writeGate != null && !parkedWrite.getAndSet(true)) {
+                    inside.complete(Unit)
+                    writeGate.await()
+                }
+                simDao.upsert(player)
+            }
+        }
+        return PlayerRepository(
+            gatedDao,
+            db.questProgressDao(),
+            db.farmingPatchDao(),
+            json,
+            DailyQuestRepository(gameData),
+            WeeklyQuestRepository(gameData),
+            BuffNotificationScheduler(context),
+            gameData,
+            boostRepo,
+            db,
+        )
+    }
 
     /** A session DAO wrapper that parks the first [getActiveSession] call on [gate]. */
     private fun gatedSessionDao(

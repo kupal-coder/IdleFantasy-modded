@@ -189,6 +189,34 @@ object RealitySimulator {
     internal suspend fun <T> withSimulatorLock(block: suspend () -> T): T =
         simulatorMutex.withLock { block() }
 
+    /**
+     * Operation scope for the routing switch. [com.fantasyidler.repository.PlayerRepository]
+     * runs every player read-modify-write inside [PlayerRepository.playerMutex], and every
+     * repository with a multi-step gameplay operation (farming, church, house, carnival, ...)
+     * scopes the whole operation with [PlayerRepository.withLock]. Taking that lock around the
+     * flip means a routing change waits for any gameplay operation that has already resolved
+     * its target, instead of landing between its read and its write — which is what used to
+     * let a simulated player be written into Base Reality on the way out of a run.
+     *
+     * Lock order is unchanged and still one-way: [simulatorMutex] (already held by every
+     * caller) -> playerMutex, the same order [claimRewards] already uses. A gameplay operation
+     * holds playerMutex and never takes [simulatorMutex], so this cannot deadlock.
+     */
+    private suspend fun leaveReality(playerRepository: PlayerRepository) =
+        playerRepository.playerMutex.withLock {
+            isSimulationActive = false
+            discardSimulationSessions()
+        }
+
+    /** Counterpart of [leaveReality]: isolation and the isolated table become visible together. */
+    private suspend fun enterReality(playerRepository: PlayerRepository, sessions: List<SkillSession>) =
+        playerRepository.playerMutex.withLock {
+            isSimulationActive = true
+            // Published with the flag, never after it: a session read must not be able to
+            // observe isolation before the table it is supposed to read from exists.
+            _simSessions.value = sessions
+        }
+
     /** Session id the Time Skip cursor belongs to; resets when the current action changes. */
     @Volatile
     private var fastForwardSessionId: String? = null
@@ -345,10 +373,7 @@ object RealitySimulator {
         // Crash marker written to Base Reality before isolation activates, so a
         // force-close during the simulation is detected on the next launch.
         playerRepository.updateFlags(flags.copy(simRunActiveSince = System.currentTimeMillis()))
-        isSimulationActive = true
-        // Published after activation so session observers switch to the isolated table with the
-        // snapshot already in place.
-        _simSessions.value = sessionSnapshot
+        enterReality(playerRepository, sessionSnapshot)
         _phase.value = Phase.IN_SIMULATION
     }
 
@@ -377,8 +402,7 @@ object RealitySimulator {
         died: Boolean = false,
     ) {
         if (!isSimulationActive) return
-        isSimulationActive = false
-        discardSimulationSessions()
+        leaveReality(playerRepository)
         // A run whose character/save slot no longer matches must not offer rewards: claiming
         // them would apply one character's gains to another character's save.
         if (!ownsRun(activeSlot)) {
@@ -414,13 +438,13 @@ object RealitySimulator {
      * The real save keeps exactly the state it had before the run started — no stale simulated
      * value is ever restored over it.
      */
-    private suspend fun discardRun(playerRepository: PlayerRepository) {
+    private suspend fun discardRun(playerRepository: PlayerRepository) = playerRepository.playerMutex.withLock {
         isSimulationActive = false
         checkpoint = null
         _simPlayer.value = null
         discardSimulationSessions()
         originSlot = 0
-        clearCrashMarker(playerRepository)
+        clearCrashMarkerUnlocked(playerRepository)
         _phase.value = Phase.BASE_REALITY
     }
 
@@ -447,13 +471,15 @@ object RealitySimulator {
      * makes the caller wait for an in-flight Time Skip, so no simulated write can outlive the
      * character it belonged to.
      */
-    internal suspend fun invalidateRunForReplacement() = simulatorMutex.withLock {
+    internal suspend fun invalidateRunForReplacement(playerRepository: PlayerRepository) = simulatorMutex.withLock {
         if (!isSimulationActive && checkpoint == null && originSlot == 0) return@withLock
-        isSimulationActive = false
-        checkpoint = null
-        _simPlayer.value = null
-        discardSimulationSessions()
-        originSlot = 0
+        playerRepository.playerMutex.withLock {
+            isSimulationActive = false
+            checkpoint = null
+            _simPlayer.value = null
+            discardSimulationSessions()
+            originSlot = 0
+        }
         _lastSkipResult.value = null
         _phase.value = Phase.BASE_REALITY
         _runInvalidated.value = true
@@ -874,11 +900,13 @@ object RealitySimulator {
     ) {
         // Discard the temporary simulation state first so flag reads below always
         // come from the real save (this may run mid-process or at next app start).
-        isSimulationActive = false
-        _simPlayer.value = null
-        checkpoint = null
-        discardSimulationSessions()
-        originSlot = 0
+        playerRepository.playerMutex.withLock {
+            isSimulationActive = false
+            _simPlayer.value = null
+            checkpoint = null
+            discardSimulationSessions()
+            originSlot = 0
+        }
         _phase.value = Phase.BASE_REALITY
         val flags = try { playerRepository.getFlags() } catch (_: Exception) { null } ?: return
         if (flags.simRunActiveSince <= 0L) return
@@ -895,6 +923,22 @@ object RealitySimulator {
             val flags = playerRepository.getFlags()
             if (flags.simRunActiveSince > 0L) {
                 playerRepository.updateFlags(flags.copy(simRunActiveSince = 0L))
+            }
+        } catch (_: Exception) {
+            // Clearing the marker must never block a return to Base Reality.
+        }
+    }
+
+    /**
+     * [clearCrashMarker] for a caller already holding [PlayerRepository.playerMutex] — the
+     * marker has to be cleared inside the same operation scope that switched the routing off,
+     * otherwise a gameplay write from the discarded run could land on the real row first.
+     */
+    private suspend fun clearCrashMarkerUnlocked(playerRepository: PlayerRepository) {
+        try {
+            val flags = playerRepository.getFlagsUnlocked()
+            if (flags.simRunActiveSince > 0L) {
+                playerRepository.updateFlagsUnlocked(flags.copy(simRunActiveSince = 0L))
             }
         } catch (_: Exception) {
             // Clearing the marker must never block a return to Base Reality.
