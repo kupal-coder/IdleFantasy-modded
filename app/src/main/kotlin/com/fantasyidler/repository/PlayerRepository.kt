@@ -11,6 +11,7 @@ import com.fantasyidler.data.model.*
 import com.fantasyidler.simulator.HeirloomStats
 import com.fantasyidler.simulator.PrestigeBoosts
 import com.fantasyidler.simulator.PrestigePoints
+import com.fantasyidler.simulator.RealitySimulator
 import com.fantasyidler.simulator.SkillSimulator
 import com.fantasyidler.simulator.XpTable
 import com.fantasyidler.ui.viewmodel.combatLevelFrom
@@ -209,6 +210,18 @@ class PlayerRepository @Inject constructor(
         sessionId: String? = null,
         applyXpBoosts: Boolean = true,
     ): List<String> = playerMutex.withLock {
+        applySessionResultsUnlocked(skillName, xpGained, itemsGained, efficiencyMultiplier, sessionId, applyXpBoosts)
+    }
+
+    /** Lock-free variant for callers already inside [playerMutex] (or [inPlayerTransaction]). */
+    internal suspend fun applySessionResultsUnlocked(
+        skillName: String,
+        xpGained: Long,
+        itemsGained: Map<String, Int>,
+        efficiencyMultiplier: Float = 1.0f,
+        sessionId: String? = null,
+        applyXpBoosts: Boolean = true,
+    ): List<String> {
         val player    = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         // Sigil stones apply game-wide, so mainland collects pick up the same xp/loot mults
@@ -557,7 +570,7 @@ class PlayerRepository @Inject constructor(
     /** Adds qty of item to the player's inventory at no coin cost (prize/drop grant). */
     suspend fun grantItem(key: String, qty: Int = 1) = playerMutex.withLock { grantItemUnlocked(key, qty) }
 
-    private suspend fun grantItemUnlocked(key: String, qty: Int = 1) {
+    internal suspend fun grantItemUnlocked(key: String, qty: Int = 1) {
         require(qty >= 0) { "Cannot grant negative quantity" }
         val player = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
@@ -672,6 +685,17 @@ class PlayerRepository @Inject constructor(
     }
 
     suspend fun <T> withLock(block: suspend () -> T): T = playerMutex.withLock { block() }
+
+    /**
+     * Runs [block] as one all-or-nothing player write: nothing else can write the player row
+     * while it runs, and if it throws, every write inside is rolled back. Used where a group of
+     * separate player updates must land together or not at all (the Simulator's reward claim:
+     * a partially applied payout would keep some rewards and lose the rest).
+     *
+     * [block] must only use the `*Unlocked` helpers — [playerMutex] is not reentrant.
+     */
+    suspend fun <T> inPlayerTransaction(block: suspend () -> T): T =
+        playerMutex.withLock { appDatabase.withTransaction { block() } }
 
     internal suspend fun updateFlagsUnlocked(flags: PlayerFlags) {
         // Single-column update: replacing the whole row rewrote every JSON blob and made
@@ -1539,13 +1563,13 @@ class PlayerRepository @Inject constructor(
      * pet keys were absent from pets.json. Moves any matching inventory items into
      * the OwnedPet list and removes them from inventory.
      */
-    suspend fun migratePetsFromInventory(petKeys: Set<String>) {
+    suspend fun migratePetsFromInventory(petKeys: Set<String>) = playerMutex.withLock {
         val player = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
         val pets: MutableList<OwnedPet> = json.decodeFromString(player.pets)
         val ownedIds = pets.map { it.id }.toSet()
         val toMigrate = petKeys.filter { it in inventory && it !in ownedIds }
-        if (toMigrate.isEmpty()) return
+        if (toMigrate.isEmpty()) return@withLock
         toMigrate.forEach { key ->
             inventory.remove(key)
             pets.add(OwnedPet(id = key, boostPercent = 0))
@@ -1580,19 +1604,19 @@ class PlayerRepository @Inject constructor(
     suspend fun consumeMaterials(
         materialsPerItem: Map<String, Int>,
         quantity: Int,
-    ): Boolean {
+    ): Boolean = playerMutex.withLock {
         val player    = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
 
         for ((item, needed) in materialsPerItem) {
-            if ((inventory[item] ?: 0) < needed * quantity) return false
+            if ((inventory[item] ?: 0) < needed * quantity) return@withLock false
         }
         for ((item, needed) in materialsPerItem) {
             val remaining = (inventory[item] ?: 0) - needed * quantity
             if (remaining <= 0) inventory.remove(item) else inventory[item] = remaining
         }
         playerDao.upsert(player.copy(inventory = json.encode<Map<String, Int>>(inventory)))
-        return true
+        return@withLock true
     }
 
     /** Returns a JSON string capturing the full player save including quest progress and sessions. */
@@ -1622,7 +1646,23 @@ class PlayerRepository @Inject constructor(
      * An ironman save whose signature is missing or does not match its core fields was edited
      * outside the game; it still imports, but as a regular (non-ironman) character.
      */
-    suspend fun importSave(jsonString: String): ImportedSave = playerMutex.withLock {
+    suspend fun importSave(jsonString: String): ImportedSave {
+        // A Simulator run is checkpointed from the character this import is about to replace:
+        // importing another character invalidates the run, so its rewards can never be claimed
+        // onto a different save. Must run before the import — afterwards the import's own
+        // writes would land in the temporary simulation state instead of Base Reality.
+        RealitySimulator.invalidateRunForReplacement(this)
+        return playerMutex.withLock { importSaveUnlocked(jsonString) }
+    }
+
+    /**
+     * [importSave] for a caller that already owns the routing scope: [RealitySimulator]'s
+     * lifecycle gate (so no run can start mid-import) and [playerMutex], which the caller takes
+     * with [withLock] in that order — simulatorMutex -> playerMutex, never the reverse. The
+     * invalidation is skipped because a caller holding the gate has already established that no
+     * run is active, and the gate is not reentrant.
+     */
+    internal suspend fun importSaveUnlocked(jsonString: String): ImportedSave {
         var export = json.decodeFromString<PlayerExport>(stripJsonGarbage(jsonString))
         var ironmanDemoted = false
         val importedFlags = try { json.decodeFromString<PlayerFlags>(export.flags) } catch (_: Exception) { null }
@@ -1648,7 +1688,7 @@ class PlayerRepository @Inject constructor(
             farmingPatchDao.clearAll()
             export.farmingPatches.forEach { farmingPatchDao.upsert(it) }
         }
-        ImportedSave(export, ironmanDemoted)
+        return ImportedSave(export, ironmanDemoted)
     }
 
     /**
@@ -1688,6 +1728,14 @@ class PlayerRepository @Inject constructor(
     }
 
     suspend fun resetProgression(ironman: Boolean = false) {
+        // Same rule as [importSave]: resetting replaces the character a Simulator run was
+        // checkpointed from, so the run and its claimable rewards die with it.
+        RealitySimulator.invalidateRunForReplacement(this)
+        playerMutex.withLock { resetProgressionUnlocked(ironman) }
+    }
+
+    /** [resetProgression] for a caller that already holds [playerMutex] (see [importSaveUnlocked]). */
+    internal suspend fun resetProgressionUnlocked(ironman: Boolean = false) {
         val previousFlags = playerDao.getPlayer()?.let { player ->
             try { json.decodeFromString<PlayerFlags>(player.flags) } catch (_: Exception) { null }
         }
@@ -1897,7 +1945,7 @@ class PlayerRepository @Inject constructor(
 
 
     /** Seeds seenItemKeys from current inventory + equipped; always ensures starting items are present. */
-    suspend fun migrateSeenItems() {
+    suspend fun migrateSeenItems() = playerMutex.withLock {
         val player = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         val startingItems = setOf("bronze_pickaxe", "bronze_axe", "bronze_fishing_rod", "bronze_boots")
@@ -1908,7 +1956,7 @@ class PlayerRepository @Inject constructor(
                     flags = json.encode<PlayerFlags>(flags.copy(seenItemKeys = flags.seenItemKeys + missing))
                 ))
             }
-            return
+            return@withLock
         }
         val inventory: Map<String, Int> = json.decodeFromString(player.inventory)
         val equipped: Map<String, String?> = json.decodeFromString(player.equipped)

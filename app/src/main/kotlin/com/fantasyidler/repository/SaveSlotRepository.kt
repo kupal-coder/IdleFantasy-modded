@@ -111,9 +111,26 @@ class SaveSlotRepository @Inject constructor(
      * pass below completes them and catches up the queue exactly as if the app had been closed.
      * Session/buff/backup alarms are re-registered for the restored character.
      * Returns true if an edited ironman save was demoted to a regular character.
+     *
+     * Throws [IllegalStateException] while a Simulator run is active: every path below
+     * replaces state a run is bound to (the player row, its sessions, quests and farming
+     * patches), and the run is refused rather than torn down underneath the player. Callers
+     * that can be reached from the UI check [RealitySimulator.isSimulationActive] first and
+     * surface a message; this is the hard guard for every other caller.
      */
-    suspend fun importFullSave(jsonString: String, freezeSessionTimers: Boolean = true): Boolean {
-        val (export, ironmanDemoted) = playerRepo.importSave(jsonString)
+    suspend fun importFullSave(jsonString: String, freezeSessionTimers: Boolean = true): Boolean =
+        // The whole import — refusal check, player row, sessions, quests, farming, alarms —
+        // runs under the Simulator lifecycle gate, the same lock enterSimulation() takes, so a
+        // run cannot start after the check and land in the middle of the replacement.
+        RealitySimulator.withSimulatorLock { importFullSaveLocked(jsonString, freezeSessionTimers) }
+
+    /**
+     * Body of [importFullSave], for a caller that already holds the lifecycle gate
+     * ([switchTo]): it must not take the gate again — it is not reentrant.
+     */
+    private suspend fun importFullSaveLocked(jsonString: String, freezeSessionTimers: Boolean): Boolean {
+        if (RealitySimulator.isSimulationActive) throw IllegalStateException("simulation active")
+        val (export, ironmanDemoted) = playerRepo.withLock { playerRepo.importSaveUnlocked(jsonString) }
         // Imported flags may predate the guild-leveling rework (reputation -> daily-count),
         // and importing overwrites the current save's migration state wholesale, so this
         // must re-run here rather than relying on the one-time app-startup call.
@@ -199,42 +216,50 @@ class SaveSlotRepository @Inject constructor(
             val current = globalStateRepo.getActiveSaveSlot()
             if (targetSlot == current) return@withLock false
 
-            // A Simulator run is bound to the character/save slot that started it: switching
-            // would leave its isolated state — and its claimable rewards — pointing at a
-            // character that is no longer loaded. Refuse until the run is finished or discarded
-            // (SaveSlotsViewModel surfaces the message; this guards every other caller).
-            if (RealitySimulator.isSimulationActive) return@withLock false
-
             // Back up the outgoing character to its own external file while it is still live,
             // so an inactive character always has a fresh backup to restore from (issue #1640:
             // a cleared app storage lost the character whose backup never fired while active).
+            // It takes the lifecycle gate for its own snapshot, so it stays outside the one
+            // below (the gate is not reentrant).
             backupScheduler.performBackup(playerRepo)
 
-            switchInProgress = true
-            try {
-                slotsDir.mkdirs()
-                writeAtomic(pendingSwitchFile(), targetSlot.toString())
+            // The refusal check, the outgoing snapshot, and the switch itself are one
+            // protected lifecycle operation under the same lock enterSimulation() takes: a run
+            // cannot start halfway through and end up checkpointed from a half-switched
+            // character, and a run that is already active is still refused outright.
+            RealitySimulator.withSimulatorLock {
+                // A Simulator run is bound to the character/save slot that started it: switching
+                // would leave its isolated state — and its claimable rewards — pointing at a
+                // character that is no longer loaded. Refuse until the run is finished or
+                // discarded (SaveSlotsViewModel surfaces the message; this guards every caller).
+                if (RealitySimulator.isSimulationActive) return@withSimulatorLock false
 
-                snapshotCurrent(current)
+                switchInProgress = true
+                try {
+                    slotsDir.mkdirs()
+                    writeAtomic(pendingSwitchFile(), targetSlot.toString())
 
-                val target = slotFile(targetSlot)
-                var ironmanDemoted = false
-                if (target.exists()) {
-                    ironmanDemoted = importFullSave(target.readText(), freezeSessionTimers = false)
-                } else {
-                    sessionRepo.deleteAllSessions()
-                    sessionRepo.deleteAllWorkerSessions()
-                    questRepo.resetAllProgress()
-                    farmingRepo.resetAllPatches()
-                    playerRepo.resetProgression(ironman = createIronman)
-                    rescheduleAlarmsFromFlags()
+                    snapshotCurrent(current)
+
+                    val target = slotFile(targetSlot)
+                    var ironmanDemoted = false
+                    if (target.exists()) {
+                        ironmanDemoted = importFullSaveLocked(target.readText(), freezeSessionTimers = false)
+                    } else {
+                        sessionRepo.deleteAllSessions()
+                        sessionRepo.deleteAllWorkerSessions()
+                        questRepo.resetAllProgress()
+                        farmingRepo.resetAllPatches()
+                        playerRepo.withLock { playerRepo.resetProgressionUnlocked(ironman = createIronman) }
+                        rescheduleAlarmsFromFlags()
+                    }
+                    globalStateRepo.setActiveSaveSlot(targetSlot)
+                    pendingSwitchFile().delete()
+                    _switchEvents.tryEmit(Unit)
+                    ironmanDemoted
+                } finally {
+                    switchInProgress = false
                 }
-                globalStateRepo.setActiveSaveSlot(targetSlot)
-                pendingSwitchFile().delete()
-                _switchEvents.tryEmit(Unit)
-                ironmanDemoted
-            } finally {
-                switchInProgress = false
             }
         }
     }
@@ -253,7 +278,11 @@ class SaveSlotRepository @Inject constructor(
             marker.delete()
             return@withContext false
         }
-        switchMutex.withLock {
+        val recovered = switchMutex.withLock {
+            // A run cannot survive the process that started it, so this only ever runs in Base
+            // Reality; refuse rather than tear one down if one is somehow still active, and let
+            // the marker retry on the next launch.
+            if (RealitySimulator.isSimulationActive) return@withLock false
             switchInProgress = true
             try {
                 val target = slotFile(targetSlot)
@@ -261,10 +290,26 @@ class SaveSlotRepository @Inject constructor(
                 globalStateRepo.setActiveSaveSlot(targetSlot)
                 pendingSwitchFile().delete()
                 _switchEvents.tryEmit(Unit)
+                true
             } finally {
                 switchInProgress = false
             }
         }
+        recovered
+    }
+
+    /**
+     * Wipes the current character: every session, all quest progress, every farming patch, and
+     * the player row itself. Returns false (and changes nothing) while a Simulator run is
+     * active — a run is bound to the character being erased, and non-isolated state (quests,
+     * farming, sessions) must not be rewritten underneath a run the player is still inside.
+     */
+    suspend fun resetProgression(): Boolean = RealitySimulator.withSimulatorLock {
+        if (RealitySimulator.isSimulationActive) return@withSimulatorLock false
+        sessionRepo.deleteAllSessions()
+        questRepo.resetAllProgress()
+        farmingRepo.resetAllPatches()
+        playerRepo.withLock { playerRepo.resetProgressionUnlocked() }
         true
     }
 

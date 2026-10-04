@@ -2682,5 +2682,6 @@
     <string name="simulator_error">An unexpected error occurred. Returning to Base Reality.</string>
     <string name="simulator_invalid_run">Simulation is no longer valid. Returning to Base Reality.</string>
     <string name="simulator_switch_blocked">Finish or discard the current simulation before switching characters.</string>
+    <string name="simulator_replace_blocked">Finish or discard the current simulation before importing, resetting, or switching characters.</string>
     <string name="simulator_offline">You are offline. Simulation continues with local data only.</string>
 </resources>
