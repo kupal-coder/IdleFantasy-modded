@@ -688,6 +688,26 @@ class SimulatorIsolationTest {
     }
 
     @Test
+    fun `corrupt player data fails safely instead of starting a run`() = runBlocking {
+        seedPlayer()
+        realPlayerDao.upsert(realPlayerDao.getPlayer()!!.copy(flags = "{oops"))
+        val sessionsBefore = realSessions()
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+
+        assertFalse(RealitySimulator.isSimulationActive)
+        assertTrue(RealitySimulator.crashedLastRun.value)
+        assertEquals(Phase.BASE_REALITY, RealitySimulator.phase.value)
+        assertNull(RealitySimulator.simPlayer.value)
+        assertTrue(RealitySimulator.simSessions.value.isEmpty())
+        assertFalse("an uncheckpointed run must not be claimable", RealitySimulator.ownsRun(1))
+        // Nothing was written to Base Reality — not even the crash marker, which is only set
+        // once the checkpoint succeeded.
+        assertEquals("{oops", realPlayerDao.getPlayer()!!.flags)
+        assertEquals(sessionsBefore, realSessions())
+    }
+
+    @Test
     fun `corrupt session frames discard only the simulation and report the error`() = runBlocking {
         val base = seedBaseReality()
         val realBefore = realPlayerDao.getPlayer()!!
