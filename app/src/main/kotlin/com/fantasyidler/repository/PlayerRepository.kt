@@ -194,6 +194,13 @@ class PlayerRepository @Inject constructor(
             flags.copy(heirloomMirrorTargets = flags.heirloomMirrorTargets.filterKeys { it in validSessionIds })
         }
 
+    /** Lock-free variant for callers already inside [playerMutex]. */
+    internal suspend fun pruneHeirloomMirrorTargetsUnlocked(validSessionIds: Set<String>) {
+        val current = getFlagsUnlocked()
+        val updated = current.copy(heirloomMirrorTargets = current.heirloomMirrorTargets.filterKeys { it in validSessionIds })
+        if (updated != current) updateFlagsUnlocked(updated)
+    }
+
     /** Adds loot to the inventory; heirlooms are unique and never stack past one. */
     private fun grantItems(inventory: MutableMap<String, Int>, items: Map<String, Int>) {
         for ((item, qty) in items) {
@@ -685,6 +692,10 @@ class PlayerRepository @Inject constructor(
     }
 
     suspend fun <T> withLock(block: suspend () -> T): T = playerMutex.withLock { block() }
+
+    /** [withLock] unless the caller already holds [playerMutex]. */
+    suspend fun <T> withLockUnlessHeld(held: Boolean, block: suspend () -> T): T =
+        if (held) block() else withLock(block)
 
     /**
      * Runs [block] as one all-or-nothing player write: nothing else can write the player row

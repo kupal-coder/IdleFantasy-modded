@@ -97,17 +97,6 @@ class SimulatorViewModel @Inject constructor(
         }
     }
 
-    fun exitSimulation() {
-        viewModelScope.launch {
-            try {
-                RealitySimulator.exitSimulation(playerRepo, sessionRepo, activeSlot())
-                refreshRewardPool()
-            } catch (e: Exception) {
-                abortWithCrashMessage()
-            }
-        }
-    }
-
     fun acknowledgeDeath() {
         viewModelScope.launch {
             try {

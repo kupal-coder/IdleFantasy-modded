@@ -42,16 +42,33 @@ class SessionRepository @Inject constructor(
     fun activeWorkerSessionFlow(slot: Int): Flow<SkillSession?> =
         sessionDao.observeActiveWorkerSession(slot)
 
-    suspend fun getActiveSession(): SkillSession? = sessionDao.getActiveSession()
+    /**
+     * Every session operation lives inside [playerRepo.playerMutex] (unless the caller
+     * already holds it), the same boundary
+     * [com.fantasyidler.simulator.RealitySimulator] takes for every Layer 1/Layer 2
+     * transition. An operation that spans suspended routing reads therefore cannot be
+     * split by an enter/exit/death, and a death or enter waits until it finishes.
+     */
+    private suspend fun <T> sessionOp(playerMutexHeld: Boolean, block: suspend () -> T): T =
+        if (playerMutexHeld) block() else playerRepo.playerMutex.withLock { block() }
 
-    suspend fun getActiveWorkerSession(slot: Int): SkillSession? =
-        sessionDao.getActiveWorkerSession(slot)
+    /** Runs [block] while holding the same lifecycle boundary [sessionOp] uses. */
+    suspend fun <T> withSessionLock(block: suspend () -> T): T =
+        playerRepo.playerMutex.withLock(block)
 
-    suspend fun getAllCompletedWorkerSessions(slot: Int): List<SkillSession> =
-        sessionDao.getAllCompletedWorkerSessions(slot)
+    suspend fun getActiveSession(playerMutexHeld: Boolean = false): SkillSession? =
+        sessionOp(playerMutexHeld) { sessionDao.getActiveSession() }
 
-    suspend fun deleteAllWorkerSessions(slot: Int) = sessionDao.deleteAllWorkerSessions(slot)
-    suspend fun deleteAllWorkerSessions() = sessionDao.deleteAllWorkerSessions()
+    suspend fun getActiveWorkerSession(slot: Int, playerMutexHeld: Boolean = false): SkillSession? =
+        sessionOp(playerMutexHeld) { sessionDao.getActiveWorkerSession(slot) }
+
+    suspend fun getAllCompletedWorkerSessions(slot: Int, playerMutexHeld: Boolean = false): List<SkillSession> =
+        sessionOp(playerMutexHeld) { sessionDao.getAllCompletedWorkerSessions(slot) }
+
+    suspend fun deleteAllWorkerSessions(slot: Int, playerMutexHeld: Boolean = false) =
+        sessionOp(playerMutexHeld) { sessionDao.deleteAllWorkerSessions(slot) }
+    suspend fun deleteAllWorkerSessions(playerMutexHeld: Boolean = false) =
+        sessionOp(playerMutexHeld) { sessionDao.deleteAllWorkerSessions() }
 
     /**
      * Persist a new session and schedule an AlarmManager alarm for completion.
@@ -95,14 +112,15 @@ class SessionRepository @Inject constructor(
             startBootCount = if (insertAsCompleted) null else currentBootCount(),
             isElderSession = isElderSession,
         )
-        sessionDao.insert(session)
-        if (playerMutexHeld) playerRepo.stampHeirloomMirrorTargetsUnlocked(session.sessionId, weaponSlot)
-        else playerRepo.stampHeirloomMirrorTargets(session.sessionId, weaponSlot)
-        if (!insertAsCompleted) {
-            val alarmAt = if (alarmOffsetMs != null) startedAt + alarmOffsetMs else session.endsAt
-            scheduleAlarm(session.sessionId, alarmAt, skillDisplayName)
+        return sessionOp(playerMutexHeld) {
+            sessionDao.insert(session)
+            playerRepo.stampHeirloomMirrorTargetsUnlocked(session.sessionId, weaponSlot)
+            if (!insertAsCompleted) {
+                val alarmAt = if (alarmOffsetMs != null) startedAt + alarmOffsetMs else session.endsAt
+                scheduleAlarm(session.sessionId, alarmAt, skillDisplayName)
+            }
+            session
         }
-        return session
     }
 
     suspend fun startWorkerSession(
@@ -132,16 +150,19 @@ class SessionRepository @Inject constructor(
             startElapsedMs       = SystemClock.elapsedRealtime(),
             startBootCount       = currentBootCount(),
         )
-        sessionDao.insert(session)
-        if (playerMutexHeld) playerRepo.stampHeirloomMirrorTargetsUnlocked(session.sessionId, weaponSlot)
-        else playerRepo.stampHeirloomMirrorTargets(session.sessionId, weaponSlot)
-        scheduleAlarm(session.sessionId, session.endsAt, skillDisplayName)
-        return session
+        return sessionOp(playerMutexHeld) {
+            sessionDao.insert(session)
+            playerRepo.stampHeirloomMirrorTargetsUnlocked(session.sessionId, weaponSlot)
+            scheduleAlarm(session.sessionId, session.endsAt, skillDisplayName)
+            session
+        }
     }
 
-    suspend fun markCompleted(sessionId: String) {
-        cancelAlarm(sessionId)
-        sessionDao.markCompleted(sessionId)
+    suspend fun markCompleted(sessionId: String, playerMutexHeld: Boolean = false) {
+        sessionOp(playerMutexHeld) {
+            cancelAlarm(sessionId)
+            sessionDao.markCompleted(sessionId)
+        }
     }
 
     /**
@@ -162,16 +183,17 @@ class SessionRepository @Inject constructor(
      * alongside owned heirlooms, otherwise two queued sessions can each roll the same
      * unique before the first is collected (issue #1618).
      */
-    suspend fun pendingHeirloomKeys(): Set<String> {
-        val heirloomKeys = gameData.equipment.filterValues { it.heirloomSkill != null }.keys
-        if (heirloomKeys.isEmpty()) return emptySet()
-        return sessionDao.getAllSessions().flatMapTo(mutableSetOf()) { session ->
-            try {
-                val frames: List<SessionFrame> = json.decodeFromString(session.frames)
-                frames.flatMap { frame -> frame.items.keys.filter { it in heirloomKeys } }
-            } catch (_: Exception) { emptyList() }
+    suspend fun pendingHeirloomKeys(playerMutexHeld: Boolean = false): Set<String> =
+        sessionOp(playerMutexHeld) {
+            val heirloomKeys = gameData.equipment.filterValues { it.heirloomSkill != null }.keys
+            if (heirloomKeys.isEmpty()) return@sessionOp emptySet()
+            sessionDao.getAllSessions().flatMapTo(mutableSetOf()) { session ->
+                try {
+                    val frames: List<SessionFrame> = json.decodeFromString(session.frames)
+                    frames.flatMap { frame -> frame.items.keys.filter { it in heirloomKeys } }
+                } catch (_: Exception) { emptyList() }
+            }
         }
-    }
 
     /**
      * True when [session]'s completion time is consistent with its monotonic anchor.
@@ -180,15 +202,16 @@ class SessionRepository @Inject constructor(
      * when the anchor or boot count is missing, or when the device rebooted since the
      * session started (elapsedRealtime restarts at boot, making the anchor meaningless).
      */
-    suspend fun hasTrustedClock(session: SkillSession): Boolean {
-        val anchor = session.startElapsedMs ?: return true
-        if (!isIronman()) return true
-        val bootCount = currentBootCount()
-        if (session.startBootCount == null || bootCount == null || bootCount != session.startBootCount) return true
-        val elapsedSinceStart = SystemClock.elapsedRealtime() - anchor
-        if (elapsedSinceStart < 0L) return true
-        return System.currentTimeMillis() - session.startedAt <= elapsedSinceStart + CLOCK_SKEW_TOLERANCE_MS
-    }
+    suspend fun hasTrustedClock(session: SkillSession, playerMutexHeld: Boolean = false): Boolean =
+        sessionOp(playerMutexHeld) {
+            val anchor = session.startElapsedMs ?: return@sessionOp true
+            if (!isIronman()) return@sessionOp true
+            val bootCount = currentBootCount()
+            if (session.startBootCount == null || bootCount == null || bootCount != session.startBootCount) return@sessionOp true
+            val elapsedSinceStart = SystemClock.elapsedRealtime() - anchor
+            if (elapsedSinceStart < 0L) return@sessionOp true
+            System.currentTimeMillis() - session.startedAt <= elapsedSinceStart + CLOCK_SKEW_TOLERANCE_MS
+        }
 
     private suspend fun isIronman(): Boolean = try {
         playerDao.getPlayer()?.let { json.decodeFromString<PlayerFlags>(it.flags).ironman } ?: false
@@ -210,60 +233,65 @@ class SessionRepository @Inject constructor(
     suspend fun completeOverdueSessions(
         starter: QueuedSessionStarter,
         workerStarter: WorkerQueuedSessionStarter? = null,
+        playerMutexHeld: Boolean = false,
     ): Unit = watchdogMutex.withLock {
-        val now = System.currentTimeMillis()
-        val session = getActiveSession()
-        if (session != null && !session.completed) {
-            val endMs = if (session.skillName == "boss") bossFightEndMs(session) else session.endsAt
-            if (now >= endMs && hasTrustedClock(session)) {
-                markCompleted(session.sessionId)
-                var catchUpMs = now - endMs
-                while (catchUpMs > 0) {
-                    val used = try { starter.insertNextQueuedAsOffline(catchUpMs) } catch (_: Exception) { 0L }
-                    if (used == 0L) break
-                    catchUpMs -= used
-                }
-                try { starter.startNextQueued(backdateMs = catchUpMs.coerceAtLeast(0L)) } catch (_: Exception) {}
-            }
-        } else if (session != null && session.completed) {
-            // The session already finished but the next queued item never started (e.g. the
-            // process died between the alarm's markCompleted and its startNextQueued, which
-            // aggressive battery savers do). Keep retrying every tick, back-dating by the
-            // time lost since the session ended — an unbackdated start here permanently
-            // pushed the queue's schedule late (issue #1739).
-            if (hasTrustedClock(session)) {
+        sessionOp(playerMutexHeld) {
+            val now = System.currentTimeMillis()
+            val session = getActiveSession(playerMutexHeld = true)
+            if (session != null && !session.completed) {
                 val endMs = if (session.skillName == "boss") bossFightEndMs(session) else session.endsAt
-                var catchUpMs = maxOf(0L, now - endMs)
-                while (catchUpMs > 0) {
-                    val used = try { starter.insertNextQueuedAsOffline(catchUpMs) } catch (_: Exception) { 0L }
-                    if (used == 0L) break
-                    catchUpMs -= used
+                if (now >= endMs && hasTrustedClock(session, playerMutexHeld = true)) {
+                    markCompleted(session.sessionId, playerMutexHeld = true)
+                    var catchUpMs = now - endMs
+                    while (catchUpMs > 0) {
+                        val used = try { starter.insertNextQueuedAsOffline(catchUpMs, playerMutexHeld = true) } catch (_: Exception) { 0L }
+                        if (used == 0L) break
+                        catchUpMs -= used
+                    }
+                    try { starter.startNextQueued(backdateMs = catchUpMs.coerceAtLeast(0L), playerMutexHeld = true) } catch (_: Exception) {}
                 }
-                try { starter.startNextQueued(backdateMs = catchUpMs) } catch (_: Exception) {}
-            } else {
-                try { starter.startNextQueued() } catch (_: Exception) {}
+            } else if (session != null && session.completed) {
+                // The session already finished but the next queued item never started (e.g. the
+                // process died between the alarm's markCompleted and its startNextQueued, which
+                // aggressive battery savers do). Keep retrying every tick, back-dating by the
+                // time lost since the session ended — an unbackdated start here permanently
+                // pushed the queue's schedule late (issue #1739).
+                if (hasTrustedClock(session, playerMutexHeld = true)) {
+                    val endMs = if (session.skillName == "boss") bossFightEndMs(session) else session.endsAt
+                    var catchUpMs = maxOf(0L, now - endMs)
+                    while (catchUpMs > 0) {
+                        val used = try { starter.insertNextQueuedAsOffline(catchUpMs, playerMutexHeld = true) } catch (_: Exception) { 0L }
+                        if (used == 0L) break
+                        catchUpMs -= used
+                    }
+                    try { starter.startNextQueued(backdateMs = catchUpMs, playerMutexHeld = true) } catch (_: Exception) {}
+                } else {
+                    try { starter.startNextQueued(playerMutexHeld = true) } catch (_: Exception) {}
+                }
             }
-        }
-        if (workerStarter != null) {
-            for (slot in 1..2) {
-                val ws = getActiveWorkerSession(slot)
-                if (ws != null && !ws.completed && now >= ws.endsAt && hasTrustedClock(ws)) {
-                    markCompleted(ws.sessionId)
-                    try { workerStarter.startNextQueued(slot) } catch (_: Exception) {}
+            if (workerStarter != null) {
+                for (slot in 1..2) {
+                    val ws = getActiveWorkerSession(slot, playerMutexHeld = true)
+                    if (ws != null && !ws.completed && now >= ws.endsAt && hasTrustedClock(ws, playerMutexHeld = true)) {
+                        markCompleted(ws.sessionId, playerMutexHeld = true)
+                        try { workerStarter.startNextQueued(slot, playerMutexHeld = true) } catch (_: Exception) {}
+                    }
                 }
             }
         }
     }
 
-    suspend fun markAllExpiredWorkerSessions() {
-        sessionDao.markAllExpiredWorkerSessions(
-            System.currentTimeMillis(),
-            SystemClock.elapsedRealtime(),
-            CLOCK_SKEW_TOLERANCE_MS,
-            enforceClock = isIronman(),
-            // -1 never matches a stored boot count, so an unreadable setting fails open.
-            bootCount = currentBootCount() ?: -1,
-        )
+    suspend fun markAllExpiredWorkerSessions(playerMutexHeld: Boolean = false) {
+        sessionOp(playerMutexHeld) {
+            sessionDao.markAllExpiredWorkerSessions(
+                System.currentTimeMillis(),
+                SystemClock.elapsedRealtime(),
+                CLOCK_SKEW_TOLERANCE_MS,
+                enforceClock = isIronman(),
+                // -1 never matches a stored boot count, so an unreadable setting fails open.
+                bootCount = currentBootCount() ?: -1,
+            )
+        }
     }
 
     /**
@@ -272,122 +300,132 @@ class SessionRepository @Inject constructor(
      *   advances the queue via [starter].
      * - If it's still running, reschedules the alarm so it fires at the correct time.
      */
-    suspend fun recoverActiveSession(starter: QueuedSessionStarter) {
-        val session = try { getActiveSession() } catch (_: Exception) { null } ?: run {
-            starter.startNextQueued()
-            return
-        }
-        if (session.completed) {
-            if (!hasTrustedClock(session)) return
-            val endMs = if (session.skillName == "boss") bossFightEndMs(session) else session.endsAt
-            var catchUpMs = maxOf(0L, System.currentTimeMillis() - endMs)
-            while (catchUpMs > 0) {
-                val used = try { starter.insertNextQueuedAsOffline(catchUpMs) } catch (_: Exception) { 0L }
-                if (used == 0L) break
-                catchUpMs -= used
+    suspend fun recoverActiveSession(starter: QueuedSessionStarter, playerMutexHeld: Boolean = false) {
+        sessionOp(playerMutexHeld) {
+            val session = try { getActiveSession(playerMutexHeld = true) } catch (_: Exception) { null } ?: run {
+                starter.startNextQueued(playerMutexHeld = true)
+                return@sessionOp
             }
-            try { starter.startNextQueued(backdateMs = catchUpMs) } catch (_: Exception) { markCompleted(session.sessionId) }
-            return
-        }
-        // Boss sessions: endsAt is cosmetic (full duration). The session really ends
-        // at bossFightEndMs — complete or re-arm the alarm based on that moment,
-        // never on endsAt.
-        if (session.skillName == "boss") {
-            val fightEndMs = bossFightEndMs(session)
-            if (System.currentTimeMillis() >= fightEndMs && hasTrustedClock(session)) {
-                markCompleted(session.sessionId)
-                // Fast-forward the offline window like the generic path below, or a repeat
-                // chain (x100 boss runs) advances only one fight per app launch when the OS
-                // suppresses alarms for a killed app (Discord report, Aug 2026).
-                var catchUpMs = System.currentTimeMillis() - fightEndMs
+            if (session.completed) {
+                if (!hasTrustedClock(session, playerMutexHeld = true)) return@sessionOp
+                val endMs = if (session.skillName == "boss") bossFightEndMs(session) else session.endsAt
+                var catchUpMs = maxOf(0L, System.currentTimeMillis() - endMs)
                 while (catchUpMs > 0) {
-                    val used = try { starter.insertNextQueuedAsOffline(catchUpMs) } catch (_: Exception) { 0L }
+                    val used = try { starter.insertNextQueuedAsOffline(catchUpMs, playerMutexHeld = true) } catch (_: Exception) { 0L }
                     if (used == 0L) break
                     catchUpMs -= used
                 }
-                try { starter.startNextQueued(backdateMs = catchUpMs) } catch (_: Exception) { }
-            } else {
-                scheduleAlarm(session.sessionId, fightEndMs, session.skillName)
+                try { starter.startNextQueued(backdateMs = catchUpMs, playerMutexHeld = true) } catch (_: Exception) { markCompleted(session.sessionId, playerMutexHeld = true) }
+                return@sessionOp
             }
-            return
-        }
-        val now = System.currentTimeMillis()
-        try {
-            if (now >= session.endsAt && hasTrustedClock(session)) {
-                markCompleted(session.sessionId)
-                var catchUpMs = now - session.endsAt
-                while (catchUpMs > 0) {
-                    val used = starter.insertNextQueuedAsOffline(catchUpMs)
-                    if (used == 0L) break
-                    catchUpMs -= used
+            // Boss sessions: endsAt is cosmetic (full duration). The session really ends
+            // at bossFightEndMs — complete or re-arm the alarm based on that moment,
+            // never on endsAt.
+            if (session.skillName == "boss") {
+                val fightEndMs = bossFightEndMs(session)
+                if (System.currentTimeMillis() >= fightEndMs && hasTrustedClock(session, playerMutexHeld = true)) {
+                    markCompleted(session.sessionId, playerMutexHeld = true)
+                    // Fast-forward the offline window like the generic path below, or a repeat
+                    // chain (x100 boss runs) advances only one fight per app launch when the OS
+                    // suppresses alarms for a killed app (Discord report, Aug 2026).
+                    var catchUpMs = System.currentTimeMillis() - fightEndMs
+                    while (catchUpMs > 0) {
+                        val used = try { starter.insertNextQueuedAsOffline(catchUpMs, playerMutexHeld = true) } catch (_: Exception) { 0L }
+                        if (used == 0L) break
+                        catchUpMs -= used
+                    }
+                    try { starter.startNextQueued(backdateMs = catchUpMs, playerMutexHeld = true) } catch (_: Exception) { }
+                } else {
+                    scheduleAlarm(session.sessionId, fightEndMs, session.skillName)
                 }
-                starter.startNextQueued(backdateMs = catchUpMs)
-            } else {
-                scheduleAlarm(session.sessionId, session.endsAt, session.skillName)
+                return@sessionOp
             }
-        } catch (_: Exception) {
-            if (hasTrustedClock(session)) markCompleted(session.sessionId)
+            val now = System.currentTimeMillis()
+            try {
+                if (now >= session.endsAt && hasTrustedClock(session, playerMutexHeld = true)) {
+                    markCompleted(session.sessionId, playerMutexHeld = true)
+                    var catchUpMs = now - session.endsAt
+                    while (catchUpMs > 0) {
+                        val used = starter.insertNextQueuedAsOffline(catchUpMs, playerMutexHeld = true)
+                        if (used == 0L) break
+                        catchUpMs -= used
+                    }
+                    starter.startNextQueued(backdateMs = catchUpMs, playerMutexHeld = true)
+                } else {
+                    scheduleAlarm(session.sessionId, session.endsAt, session.skillName)
+                }
+            } catch (_: Exception) {
+                if (hasTrustedClock(session, playerMutexHeld = true)) markCompleted(session.sessionId, playerMutexHeld = true)
+            }
         }
     }
 
-    suspend fun recoverActiveWorkerSession(slot: Int, workerStarter: WorkerQueuedSessionStarter) {
-        val session = try { getActiveWorkerSession(slot) } catch (_: Exception) { null } ?: run {
-            workerStarter.startNextQueued(slot)
-            return
-        }
-        if (session.completed) {
-            workerStarter.startNextQueued(slot)
-            return
-        }
-        val now = System.currentTimeMillis()
-        try {
-            if (now >= session.endsAt && hasTrustedClock(session)) {
-                markCompleted(session.sessionId)
-                workerStarter.startNextQueued(slot)
-            } else {
-                scheduleAlarm(session.sessionId, session.endsAt, session.skillName)
+    suspend fun recoverActiveWorkerSession(slot: Int, workerStarter: WorkerQueuedSessionStarter, playerMutexHeld: Boolean = false) {
+        sessionOp(playerMutexHeld) {
+            val session = try { getActiveWorkerSession(slot, playerMutexHeld = true) } catch (_: Exception) { null } ?: run {
+                workerStarter.startNextQueued(slot, playerMutexHeld = true)
+                return@sessionOp
             }
-        } catch (_: Exception) {
-            if (hasTrustedClock(session)) markCompleted(session.sessionId)
+            if (session.completed) {
+                workerStarter.startNextQueued(slot, playerMutexHeld = true)
+                return@sessionOp
+            }
+            val now = System.currentTimeMillis()
+            try {
+                if (now >= session.endsAt && hasTrustedClock(session, playerMutexHeld = true)) {
+                    markCompleted(session.sessionId, playerMutexHeld = true)
+                    workerStarter.startNextQueued(slot, playerMutexHeld = true)
+                } else {
+                    scheduleAlarm(session.sessionId, session.endsAt, session.skillName)
+                }
+            } catch (_: Exception) {
+                if (hasTrustedClock(session, playerMutexHeld = true)) markCompleted(session.sessionId, playerMutexHeld = true)
+            }
         }
     }
 
-    suspend fun getSession(sessionId: String): SkillSession? = sessionDao.getSession(sessionId)
+    suspend fun getSession(sessionId: String, playerMutexHeld: Boolean = false): SkillSession? =
+        sessionOp(playerMutexHeld) { sessionDao.getSession(sessionId) }
 
     /** Every stored session: active and completed, player and both worker slots. */
-    suspend fun getAllSessions(): List<SkillSession> = sessionDao.getAllSessions()
+    suspend fun getAllSessions(playerMutexHeld: Boolean = false): List<SkillSession> =
+        sessionOp(playerMutexHeld) { sessionDao.getAllSessions() }
 
-    suspend fun abandonSession(sessionId: String) {
-        cancelAlarm(sessionId)
-        sessionDao.delete(sessionId)
-        pruneMirrorStamps()
-    }
+    suspend fun abandonSession(sessionId: String, playerMutexHeld: Boolean = false) =
+        sessionOp(playerMutexHeld) {
+            cancelAlarm(sessionId)
+            sessionDao.delete(sessionId)
+            pruneMirrorStamps()
+        }
 
     /** Delete a completed session after rewards have been applied. */
-    suspend fun deleteSession(sessionId: String) {
-        cancelAlarm(sessionId)
-        sessionDao.delete(sessionId)
-        pruneMirrorStamps()
-    }
+    suspend fun deleteSession(sessionId: String, playerMutexHeld: Boolean = false) =
+        sessionOp(playerMutexHeld) {
+            cancelAlarm(sessionId)
+            sessionDao.delete(sessionId)
+            pruneMirrorStamps()
+        }
 
-    suspend fun deleteAllSessions() {
-        sessionDao.deleteAll()
-        pruneMirrorStamps()
-    }
+    suspend fun deleteAllSessions(playerMutexHeld: Boolean = false) =
+        sessionOp(playerMutexHeld) {
+            sessionDao.deleteAll()
+            pruneMirrorStamps()
+        }
 
     private suspend fun pruneMirrorStamps() =
-        playerRepo.pruneHeirloomMirrorTargets(sessionDao.getAllSessions().mapTo(mutableSetOf()) { it.sessionId })
+        playerRepo.pruneHeirloomMirrorTargetsUnlocked(sessionDao.getAllSessions().mapTo(mutableSetOf()) { it.sessionId })
 
-    suspend fun insertSession(session: SkillSession) = sessionDao.insert(session)
+    suspend fun insertSession(session: SkillSession, playerMutexHeld: Boolean = false) =
+        sessionOp(playerMutexHeld) { sessionDao.insert(session) }
 
-    suspend fun getRecentCompleted(limit: Int = 20): List<SkillSession> =
-        sessionDao.getRecentCompleted(limit)
+    suspend fun getRecentCompleted(limit: Int = 20, playerMutexHeld: Boolean = false): List<SkillSession> =
+        sessionOp(playerMutexHeld) { sessionDao.getRecentCompleted(limit) }
 
-    suspend fun getAllCompletedSessions(): List<SkillSession> =
-        sessionDao.getAllCompletedSessions()
+    suspend fun getAllCompletedSessions(playerMutexHeld: Boolean = false): List<SkillSession> =
+        sessionOp(playerMutexHeld) { sessionDao.getAllCompletedSessions() }
 
-    suspend fun getOldestCompletedSession(): SkillSession? =
-        sessionDao.getOldestCompletedSession()
+    suspend fun getOldestCompletedSession(playerMutexHeld: Boolean = false): SkillSession? =
+        sessionOp(playerMutexHeld) { sessionDao.getOldestCompletedSession() }
 
     // ------------------------------------------------------------------
 

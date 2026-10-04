@@ -60,6 +60,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Provider
@@ -341,7 +342,7 @@ class SimulatorIsolationTest {
         assertNotNull("playerFlow never emitted the simulated player", simulated)
         assertEquals("the real save moved during the simulation", baseCoins, realPlayerDao.getPlayer()!!.coins)
 
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         val restored = withTimeoutOrNull(5_000) {
             playerRepo.playerFlow.first { it != null && it.coins == baseCoins }
         }
@@ -377,7 +378,7 @@ class SimulatorIsolationTest {
             waitFor { seen.last()?.coins == 1_000L },
         )
 
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         assertTrue(
             "an observer kept serving the simulated player after the run ended",
             waitFor { seen.last()?.coins == 999_999L },
@@ -833,7 +834,7 @@ class SimulatorIsolationTest {
 
         RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
         RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
 
         val pool = RealitySimulator.rewardPool()
@@ -911,7 +912,7 @@ class SimulatorIsolationTest {
         assertEquals(1_000L + 3_150L, simXp()["mining"])
         assertEquals(5 + 126, simInventory()["iron_ore"])
 
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         val xpReward = RealitySimulator.rewardPool().first { it.kind == RewardKind.SKILL_XP && it.id == "mining" }
         assertTrue(RealitySimulator.claimRewards(playerRepo, listOf(xpReward), 1))
 
@@ -1005,7 +1006,7 @@ class SimulatorIsolationTest {
         // it can no longer progress, so the routing switch either already happened (bug) or is
         // waiting for the gameplay operation to finish (fixed).
         val exit = async(start = CoroutineStart.UNDISPATCHED) {
-            RealitySimulator.exitSimulation(gatedPlayerRepo, sessionRepo, 1)
+            RealitySimulator.acknowledgeDeath(gatedPlayerRepo, sessionRepo, 1)
         }
         gate.complete(Unit)
         gameplay.await()
@@ -1183,7 +1184,7 @@ class SimulatorIsolationTest {
 
         RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
         RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         val pool = RealitySimulator.rewardPool()
         assertTrue(pool.isNotEmpty())
 
@@ -1239,6 +1240,18 @@ class SimulatorIsolationTest {
     /** A [SessionRepository] over an arbitrary [SkillSessionDao], sharing the run's global state. */
     private fun sessionRepositoryOver(sessionDao: SkillSessionDao): SessionRepository =
         SessionRepository(sessionDao, context, json, gameData, SimulationPlayerDao(realPlayerDao), playerRepo)
+
+    /** A [QueuedSessionStarter] over [sessionRepository], sharing this run's global state. */
+    private fun starterOver(sessionRepository: SessionRepository): QueuedSessionStarter {
+        val questRepo = QuestRepository(db.questProgressDao(), gameData)
+        val townRepo = TownRepository(gameData, playerRepo, questRepo, boostRepo)
+        val mercRepo = MercenaryRepository(playerRepo, gameData)
+        return QueuedSessionStarter(boostRepo, context, playerRepo, sessionRepository, townRepo, gameData, mercRepo, json)
+    }
+
+    /** A [WorkerQueuedSessionStarter] over [sessionRepository], sharing this run's global state. */
+    private fun workerStarterOver(sessionRepository: SessionRepository): WorkerQueuedSessionStarter =
+        WorkerQueuedSessionStarter(boostRepo, playerRepo, sessionRepository, gameData, json)
 
     /** A [SaveSlotRepository] over an arbitrary player/session repository pair, sharing this run's DB. */
     private fun saveSlotRepositoryOver(
@@ -1396,7 +1409,7 @@ class SimulatorIsolationTest {
 
         // Exit must wait for the skip that is still writing isolated state, not run beside it.
         val exit = async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
-            RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+            RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         }
         assertFalse("exit must wait for the running time skip", exit.isCompleted)
         assertTrue("the run must stay active until the exit actually runs", RealitySimulator.isSimulationActive)
@@ -1426,7 +1439,7 @@ class SimulatorIsolationTest {
         val realBefore = realPlayerDao.getPlayer()!!
 
         RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         assertFalse(RealitySimulator.isSimulationActive)
 
         val result = RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
@@ -1450,7 +1463,7 @@ class SimulatorIsolationTest {
         // Run as A, then swap the current character for B with rewards still pending.
         RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
         RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         val pool = RealitySimulator.rewardPool()
         assertTrue("the run should have rewards pending", pool.isNotEmpty())
         assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
@@ -1479,7 +1492,7 @@ class SimulatorIsolationTest {
 
         RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
         RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         val pool = RealitySimulator.rewardPool()
         assertTrue(pool.isNotEmpty())
 
@@ -1535,7 +1548,7 @@ class SimulatorIsolationTest {
             "the refused import must not have loaded another character",
             characterACoins, realPlayerDao.getPlayer()!!.coins,
         )
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         assertTrue("a refused import must not have discarded the rewards", RealitySimulator.rewardPool().isNotEmpty())
     }
 
@@ -1555,7 +1568,7 @@ class SimulatorIsolationTest {
         assertEquals(baseCoinsBefore, realPlayerDao.getPlayer()!!.coins)
         assertNotNull(realInventory()["iron_ore"])
         assertNotNull("the refused reset must not have wiped base sessions", realSessionDao.getActiveSession())
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
         assertTrue(RealitySimulator.rewardPool().isNotEmpty())
     }
 
@@ -1576,7 +1589,7 @@ class SimulatorIsolationTest {
 
         RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
         RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
-        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
 
         val pool = RealitySimulator.rewardPool()
         val itemReward = pool.first { it.kind == RewardKind.ITEM && it.id == "iron_ore" }
@@ -1680,4 +1693,270 @@ class SimulatorIsolationTest {
         assertEquals(1_000L + 1_625L, playerRepo.getOrCreatePlayer().coins)
         assertEquals(1_000L, realPlayerDao.getPlayer()!!.coins)
     }
+
+    // ------------------------------------------------------------------ Layer 2 death boundary
+    //
+    // Session operations, worker sessions, the watchdog/recovery paths, and Simulator
+    // entry all share one lifecycle boundary (PlayerRepository.playerMutex) that simulated
+    // death takes on the way out. An operation holds it for its whole read -> suspend ->
+    // write body, so death waits for it, the operation finishes against Layer 2 state,
+    // and only then is the layer torn down. These tests force the interleavings with
+    // gates — no Thread.sleep anywhere.
+
+    @Test
+    fun `a session completion cannot be split by death`() = runBlocking {
+        seedBaseReality()
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        assertTrue(RealitySimulator.isSimulationActive)
+        val sessionsBefore = realSessions()
+
+        val gate = CompletableDeferred<Unit>()
+        val insideWrite = CompletableDeferred<Unit>()
+        val events = Collections.synchronizedList(mutableListOf<String>())
+        val realSim = SimulationSessionDao(realSessionDao)
+        val gatedDao = object : SkillSessionDao by realSim {
+            override suspend fun markCompleted(sessionId: String) {
+                insideWrite.complete(Unit)
+                gate.await()
+                events += "write"
+                realSim.markCompleted(sessionId)
+            }
+        }
+        val opRepo = sessionRepositoryOver(gatedDao)
+
+        val op = async { opRepo.markCompleted("real_active") }
+        withTimeout(5_000) { insideWrite.await() }
+
+        val death = async(start = CoroutineStart.UNDISPATCHED) {
+            events += "death:start"
+            RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
+            events += "death:end"
+        }
+        assertFalse("death must wait for the in-flight session op", death.isCompleted)
+
+        gate.complete(Unit)
+        op.await()
+
+        assertEquals(listOf("death:start", "write"), events.toList())
+        assertFalse("the completion must not leak into Layer 1", realSessionDao.getSession("real_active")!!.completed)
+        assertEquals(sessionsBefore, realSessions())
+
+        death.await()
+        assertEquals(listOf("death:start", "write", "death:end"), events.toList())
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+        assertFalse(RealitySimulator.isSimulationActive)
+        assertFalse("nothing must leak into Layer 1", realSessionDao.getSession("real_active")!!.completed)
+        assertEquals(sessionsBefore, realSessions())
+    }
+
+    @Test
+    fun `a worker session completion cannot be split by death`() = runBlocking {
+        seedBaseReality()
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        assertTrue(RealitySimulator.isSimulationActive)
+        val sessionsBefore = realSessions()
+
+        val gate = CompletableDeferred<Unit>()
+        val insideWrite = CompletableDeferred<Unit>()
+        val realSim = SimulationSessionDao(realSessionDao)
+        val gatedDao = object : SkillSessionDao by realSim {
+            override suspend fun markCompleted(sessionId: String) {
+                insideWrite.complete(Unit)
+                gate.await()
+                realSim.markCompleted(sessionId)
+            }
+        }
+        val opRepo = sessionRepositoryOver(gatedDao)
+
+        val op = async { opRepo.markCompleted("worker_active") }
+        withTimeout(5_000) { insideWrite.await() }
+
+        val death = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
+        }
+        assertFalse("death must wait for the in-flight worker session op", death.isCompleted)
+
+        gate.complete(Unit)
+        op.await()
+        death.await()
+
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+        assertFalse(RealitySimulator.isSimulationActive)
+        assertFalse("the worker completion must not leak into Layer 1", realSessionDao.getSession("worker_active")!!.completed)
+        assertEquals(sessionsBefore, realSessions())
+    }
+
+    @Test
+    fun `a watchdog completion cannot be split by death`() = runBlocking {
+        seedPlayer()
+        val base = System.currentTimeMillis()
+        seedSession("overdue", "mining", "iron_ore", miningFrames(), base - 120_000L, durationMs = 60_000L)
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        assertTrue(RealitySimulator.isSimulationActive)
+        val sessionsBefore = realSessions()
+
+        val gate = CompletableDeferred<Unit>()
+        val insideRead = CompletableDeferred<Unit>()
+        val realSim = SimulationSessionDao(realSessionDao)
+        val gatedDao = object : SkillSessionDao by realSim {
+            override suspend fun getActiveSession(): SkillSession? {
+                insideRead.complete(Unit)
+                gate.await()
+                return realSim.getActiveSession()
+            }
+        }
+        val watchdogRepo = sessionRepositoryOver(gatedDao)
+        val watchdog = async { watchdogRepo.completeOverdueSessions(starterOver(sessionRepo), workerStarterOver(sessionRepo)) }
+        withTimeout(5_000) { insideRead.await() }
+
+        val death = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
+        }
+        assertFalse("death must wait for the in-flight watchdog op", death.isCompleted)
+
+        gate.complete(Unit)
+        watchdog.await()
+        death.await()
+
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+        assertFalse(RealitySimulator.isSimulationActive)
+        assertFalse("the watchdog must not complete a Layer 1 session", realSessionDao.getSession("overdue")!!.completed)
+        assertEquals(sessionsBefore, realSessions())
+    }
+
+    @Test
+    fun `a recovery completion cannot be split by death`() = runBlocking {
+        seedPlayer()
+        val base = System.currentTimeMillis()
+        seedSession("overdue", "mining", "iron_ore", miningFrames(), base - 120_000L, durationMs = 60_000L)
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        assertTrue(RealitySimulator.isSimulationActive)
+        val sessionsBefore = realSessions()
+
+        val gate = CompletableDeferred<Unit>()
+        val insideRead = CompletableDeferred<Unit>()
+        val realSim = SimulationSessionDao(realSessionDao)
+        val gatedDao = object : SkillSessionDao by realSim {
+            override suspend fun getActiveSession(): SkillSession? {
+                insideRead.complete(Unit)
+                gate.await()
+                return realSim.getActiveSession()
+            }
+        }
+        val recoveryRepo = sessionRepositoryOver(gatedDao)
+        val recovery = async { recoveryRepo.recoverActiveSession(starterOver(sessionRepo)) }
+        withTimeout(5_000) { insideRead.await() }
+
+        val death = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
+        }
+        assertFalse("death must wait for the in-flight recovery op", death.isCompleted)
+
+        gate.complete(Unit)
+        recovery.await()
+        death.await()
+
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+        assertFalse(RealitySimulator.isSimulationActive)
+        assertFalse("recovery must not complete a Layer 1 session", realSessionDao.getSession("overdue")!!.completed)
+        assertEquals(sessionsBefore, realSessions())
+    }
+
+    @Test
+    fun `there is no manual exit path out of layer 2`() = runBlocking {
+        seedBaseReality()
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        assertTrue(RealitySimulator.isSimulationActive)
+        assertEquals(Phase.IN_SIMULATION, RealitySimulator.phase.value)
+
+        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+
+        assertTrue("a non-death exit must leave the run active", RealitySimulator.isSimulationActive)
+        assertEquals(Phase.IN_SIMULATION, RealitySimulator.phase.value)
+
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
+
+        assertFalse(RealitySimulator.isSimulationActive)
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+    }
+
+    @Test
+    fun `simulator entry takes one consistent player snapshot`() = runBlocking {
+        seedBaseReality()
+        val armed = AtomicBoolean(false)
+        val gate = CompletableDeferred<Unit>()
+        val insideRead = CompletableDeferred<Unit>()
+        val gatedPlayerRepo = gatedPlayerRepository(armed, insideRead, readGate = gate)
+
+        armed.set(true)
+        val enter = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.enterSimulation(gatedPlayerRepo, sessionRepo, 1)
+        }
+        insideRead.await()
+
+        // A normal Layer 1 write is blocked until the entry snapshot — and the Layer
+        // flip that follows it — complete, so it cannot split the two.
+        val write = async(start = CoroutineStart.UNDISPATCHED) { gatedPlayerRepo.addCoins(500) }
+        assertFalse("a gameplay write must wait for the simulator entry snapshot", write.isCompleted)
+
+        gate.complete(Unit)
+        enter.await()
+        write.await()
+
+        // The run started from one pre-write Base Reality state, and the concurrent
+        // write landed entirely in Layer 2: nothing touched the real save.
+        assertTrue(RealitySimulator.isSimulationActive)
+        assertEquals(1_000L, realPlayerDao.getPlayer()!!.coins)
+        assertEquals("the write must apply to the run, not to Base Reality", 1_500L, RealitySimulator.simPlayer.value!!.coins)
+
+        RealitySimulator.acknowledgeDeath(gatedPlayerRepo, sessionRepo, 1)
+    }
+
+    @Test
+    fun `simulator entry takes one consistent player and session snapshot`() = runBlocking {
+        seedBaseReality()
+        val gate = CompletableDeferred<Unit>()
+        val insideRead = CompletableDeferred<Unit>()
+        val realSim = SimulationSessionDao(realSessionDao)
+        val gatedDao = object : SkillSessionDao by realSim {
+            override suspend fun getAllSessions(): List<SkillSession> {
+                insideRead.complete(Unit)
+                gate.await()
+                return realSim.getAllSessions()
+            }
+        }
+        val entryRepo = sessionRepositoryOver(gatedDao)
+
+        val enter = async(start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.enterSimulation(playerRepo, entryRepo, 1)
+        }
+        insideRead.await()
+
+        // The concurrent Layer 1 write touches sessions and player flags together:
+        // it cannot commit while the entry snapshot is open.
+        val write = async(start = CoroutineStart.UNDISPATCHED) {
+            sessionRepo.startSession("mining", "iron_ore", encodeFrames(miningFrames(10)), durationMs = 3_600_000L, skillDisplayName = "Mining")
+        }
+        assertFalse("a gameplay write must wait for the simulator entry snapshot", write.isCompleted)
+
+        gate.complete(Unit)
+        enter.await()
+        val started = write.await()
+
+        // At entry time neither half of the concurrent write was visible in the run...
+        assertTrue(RealitySimulator.isSimulationActive)
+        // ...the whole write then landed in Layer 2 — not in Base Reality, and not split.
+        assertNull("the write must not create a Layer 1 session", realSessionDao.getSession(started.sessionId))
+        assertTrue("the run and its flags must move to Layer 2 together",
+            RealitySimulator.simSessions.value.any { it.sessionId == started.sessionId } ==
+                stampFor(started.sessionId))
+
+        RealitySimulator.acknowledgeDeath(playerRepo, sessionRepo, 1)
+    }
+
+    /** True when the isolated player flags carry the heirloom mirror stamp for [sessionId]. */
+    private fun stampFor(sessionId: String): Boolean = runCatching {
+        json.decodeFromString<PlayerFlags>(RealitySimulator.simPlayer.value!!.flags)
+            .heirloomMirrorTargets.containsKey(sessionId)
+    }.getOrDefault(false)
 }

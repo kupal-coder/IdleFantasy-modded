@@ -208,14 +208,14 @@ object RealitySimulator {
             discardSimulationSessions()
         }
 
-    /** Counterpart of [leaveReality]: isolation and the isolated table become visible together. */
-    private suspend fun enterReality(playerRepository: PlayerRepository, sessions: List<SkillSession>) =
-        playerRepository.playerMutex.withLock {
-            isSimulationActive = true
-            // Published with the flag, never after it: a session read must not be able to
-            // observe isolation before the table it is supposed to read from exists.
-            _simSessions.value = sessions
-        }
+    /** Counterpart of [leaveReality]: isolation and the isolated table become visible together.
+     *  Callers must already hold [PlayerRepository.playerMutex]. */
+    private suspend fun enterRealityUnlocked(playerRepository: PlayerRepository, sessions: List<SkillSession>) {
+        isSimulationActive = true
+        // Published with the flag, never after it: a session read must not be able to
+        // observe isolation before the table it is supposed to read from exists.
+        _simSessions.value = sessions
+    }
 
     /** Session id the Time Skip cursor belongs to; resets when the current action changes. */
     @Volatile
@@ -338,43 +338,45 @@ object RealitySimulator {
             invalidateRun(playerRepository)
             return
         }
-        val player = try { playerRepository.getOrCreatePlayer() } catch (_: Exception) { null }
-        val flags: PlayerFlags? = try {
-            player?.let { json.decodeFromString<PlayerFlags>(it.flags) }
-        } catch (_: Exception) { null }
-        if (player == null || flags == null) {
-            // Missing or corrupt player data: fail safely rather than start a run that could
-            // not be checkpointed ("An unexpected error occurred. Returning to Base Reality.").
-            discardRun(playerRepository)
-            _crashedLastRun.value = true
-            return
+        playerRepository.playerMutex.withLock {
+            val player = try { playerRepository.getOrCreatePlayer() } catch (_: Exception) { null }
+            val flags: PlayerFlags? = try {
+                player?.let { json.decodeFromString<PlayerFlags>(it.flags) }
+            } catch (_: Exception) { null }
+            if (player == null || flags == null) {
+                // Missing or corrupt player data: fail safely rather than start a run that could
+                // not be checkpointed ("An unexpected error occurred. Returning to Base Reality.").
+                discardRunUnlocked(playerRepository)
+                _crashedLastRun.value = true
+                return@withLock
+            }
+            // Player is a flat data class of immutable JSON columns: copy() is a full deep copy.
+            checkpoint = player.copy()
+            _simPlayer.value = player.copy()
+            fastForwardSessionId = null
+            fastForwardCursor = 0
+            _lastSkipResult.value = null
+            _runInvalidated.value = false
+            originSlot = activeSlot
+            // Read the real session table while isolation is still off, so the parallel run starts
+            // from exactly the Base Reality session state (player, combat, boss, and every worker
+            // slot — active and completed) and can never write back to it. A read failure must not
+            // be mistaken for "this character has no sessions": entering with an empty snapshot
+            // would run the parallel copy against state the player never had, so fail closed
+            // ("An unexpected error occurred. Returning to Base Reality.") instead.
+            val sessionSnapshot: List<SkillSession> = try {
+                sessionRepository.getAllSessions(playerMutexHeld = true)
+            } catch (_: Exception) {
+                discardRunUnlocked(playerRepository)
+                _crashedLastRun.value = true
+                return@withLock
+            }
+            // Crash marker written to Base Reality before isolation activates, so a
+            // force-close during the simulation is detected on the next launch.
+            playerRepository.updateFlagsUnlocked(flags.copy(simRunActiveSince = System.currentTimeMillis()))
+            enterRealityUnlocked(playerRepository, sessionSnapshot)
+            _phase.value = Phase.IN_SIMULATION
         }
-        // Player is a flat data class of immutable JSON columns: copy() is a full deep copy.
-        checkpoint = player.copy()
-        _simPlayer.value = player.copy()
-        fastForwardSessionId = null
-        fastForwardCursor = 0
-        _lastSkipResult.value = null
-        _runInvalidated.value = false
-        originSlot = activeSlot
-        // Read the real session table while isolation is still off, so the parallel run starts
-        // from exactly the Base Reality session state (player, combat, boss, and every worker
-        // slot — active and completed) and can never write back to it. A read failure must not
-        // be mistaken for "this character has no sessions": entering with an empty snapshot
-        // would run the parallel copy against state the player never had, so fail closed
-        // ("An unexpected error occurred. Returning to Base Reality.") instead.
-        val sessionSnapshot: List<SkillSession> = try {
-            sessionRepository.getAllSessions()
-        } catch (_: Exception) {
-            discardRun(playerRepository)
-            _crashedLastRun.value = true
-            return
-        }
-        // Crash marker written to Base Reality before isolation activates, so a
-        // force-close during the simulation is detected on the next launch.
-        playerRepository.updateFlags(flags.copy(simRunActiveSince = System.currentTimeMillis()))
-        enterReality(playerRepository, sessionSnapshot)
-        _phase.value = Phase.IN_SIMULATION
     }
 
     /**
@@ -401,6 +403,9 @@ object RealitySimulator {
         activeSlot: Int,
         died: Boolean = false,
     ) {
+        // No normal/manual exit path: Layer 2 only ends through the player's simulated
+        // death (acknowledgeDeath → died = true).
+        if (!died) return
         if (!isSimulationActive) return
         leaveReality(playerRepository)
         // A run whose character/save slot no longer matches must not offer rewards: claiming
@@ -439,6 +444,10 @@ object RealitySimulator {
      * value is ever restored over it.
      */
     private suspend fun discardRun(playerRepository: PlayerRepository) = playerRepository.playerMutex.withLock {
+        discardRunUnlocked(playerRepository)
+    }
+
+    private suspend fun discardRunUnlocked(playerRepository: PlayerRepository) {
         isSimulationActive = false
         checkpoint = null
         _simPlayer.value = null

@@ -240,12 +240,6 @@ private fun InsideSimulationContent(
     ) {
         Text(stringResource(R.string.simulator_time_skip))
     }
-    OutlinedButton(
-        onClick = { viewModel.exitSimulation() },
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Text(stringResource(R.string.simulator_exit))
-    }
 }
 
 // ------------------------------------------------------------------ Time Skip confirm / result

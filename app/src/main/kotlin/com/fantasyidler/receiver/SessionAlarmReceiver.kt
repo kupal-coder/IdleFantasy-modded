@@ -48,32 +48,36 @@ class SessionAlarmReceiver : BroadcastReceiver() {
     }
 
     internal suspend fun processSessionAlarm(sessionId: String, skillDisplayName: String) {
-        val session = sessionRepository.getSession(sessionId)
-        if (session == null || session.completed) return
-        if (!sessionRepository.hasTrustedClock(session)) return
+        val outcome = sessionRepository.withSessionLock {
+            val session = sessionRepository.getSession(sessionId, playerMutexHeld = true)
+            if (session == null || session.completed) return@withSessionLock null
+            if (!sessionRepository.hasTrustedClock(session, playerMutexHeld = true)) return@withSessionLock null
 
-        sessionRepository.markCompleted(sessionId)
-        // The intent extra carries the English name baked in at scheduling time; resolve
-        // the localised one from the session at fire time so notifications follow the
-        // current app language (issue #1399).
-        val notifName = localizedSessionName(session, skillDisplayName).ifBlank { skillDisplayName }
-        // Compute how late the alarm fired so the next session can be backdated.
-        val now = System.currentTimeMillis()
-        val backdateMs = maxOf(0L, now - session.endsAt)
-        if (session.isWorkerSession) {
-            val slot = session.workerSlot.coerceAtLeast(1)
-            val workerStarted = workerQueuedSessionStarter.startNextQueued(slot)
-            if (!workerStarted) notificationManager.showSessionComplete(notifName)
-        } else {
+            sessionRepository.markCompleted(sessionId, playerMutexHeld = true)
+            // The intent extra carries the English name baked in at scheduling time; resolve
+            // the localised one from the session at fire time so notifications follow the
+            // current app language (issue #1399).
+            val notifName = localizedSessionName(session, skillDisplayName).ifBlank { skillDisplayName }
+            // Compute how late the alarm fired so the next session can be backdated.
+            val now = System.currentTimeMillis()
+            val backdateMs = maxOf(0L, now - session.endsAt)
             var catchUpMs = backdateMs
-            while (catchUpMs > 0) {
-                val used = try { queuedSessionStarter.insertNextQueuedAsOffline(catchUpMs) } catch (_: Exception) { 0L }
-                if (used == 0L) break
-                catchUpMs -= used
+            var started: Boolean? = null
+            if (session.isWorkerSession) {
+                val slot = session.workerSlot.coerceAtLeast(1)
+                started = workerQueuedSessionStarter.startNextQueued(slot, playerMutexHeld = true)
+            } else {
+                while (catchUpMs > 0) {
+                    val used = try { queuedSessionStarter.insertNextQueuedAsOffline(catchUpMs, playerMutexHeld = true) } catch (_: Exception) { 0L }
+                    if (used == 0L) break
+                    catchUpMs -= used
+                }
+                started = queuedSessionStarter.startNextQueued(backdateMs = catchUpMs, playerMutexHeld = true)
             }
-            val started = queuedSessionStarter.startNextQueued(backdateMs = catchUpMs)
-            if (!started) notificationManager.showSessionComplete(notifName)
-        }
+            Triple(session, notifName, started)
+        } ?: return
+        val (_, notifName, started) = outcome
+        if (started != true) notificationManager.showSessionComplete(notifName)
     }
 
     private fun localizedSessionName(session: SkillSession, fallback: String): String {
