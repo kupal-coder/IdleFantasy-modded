@@ -8,7 +8,9 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.fantasyidler.data.db.AppDatabase
 import com.fantasyidler.data.db.dao.SimulationPlayerDao
 import com.fantasyidler.data.db.dao.SimulationSessionDao
+import com.fantasyidler.data.db.dao.SkillSessionDao
 import com.fantasyidler.data.model.Player
+import com.fantasyidler.data.model.PlayerExport
 import com.fantasyidler.data.model.PlayerFlags
 import com.fantasyidler.data.model.SessionFrame
 import com.fantasyidler.data.model.SkillSession
@@ -32,8 +34,13 @@ import com.fantasyidler.repository.WeeklyQuestRepository
 import com.fantasyidler.repository.WorkerQueuedSessionStarter
 import com.fantasyidler.simulator.RealitySimulator.Phase
 import com.fantasyidler.simulator.RealitySimulator.RewardKind
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.serializer
@@ -48,6 +55,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Provider
 
 /**
@@ -69,6 +77,7 @@ class SimulatorIsolationTest {
     private lateinit var context: Context
     private lateinit var db: AppDatabase
     private lateinit var json: Json
+    private lateinit var gameData: GameDataRepository
     private lateinit var boostRepo: BoostRepository
     private lateinit var playerRepo: PlayerRepository
     private lateinit var sessionRepo: SessionRepository
@@ -86,7 +95,7 @@ class SimulatorIsolationTest {
             .allowMainThreadQueries()
             .build()
         json = Json { ignoreUnknownKeys = true }
-        val gameData = GameDataRepository(context, json)
+        gameData = GameDataRepository(context, json)
         val dailyQuestRepo = DailyQuestRepository(gameData)
         val weeklyQuestRepo = WeeklyQuestRepository(gameData)
         boostRepo = BoostRepository(gameData)
@@ -140,7 +149,9 @@ class SimulatorIsolationTest {
     fun tearDown() {
         try {
             if (::playerRepo.isInitialized) {
-                runBlocking { RealitySimulator.abortToBaseReality(playerRepo, sessionRepo) }
+                // Bounded: a failed test must never leave cleanup waiting on a lock a parked
+                // coroutine still holds (cancelling that coroutine releases the lock).
+                runBlocking { withTimeoutOrNull(5_000) { RealitySimulator.abortToBaseReality(playerRepo, sessionRepo) } }
             }
         } catch (_: Exception) {
             // Never let cleanup mask the real failure.
@@ -1028,5 +1039,332 @@ class SimulatorIsolationTest {
         assertEquals(0, result.minutes)
         assertBaseRealityUnchanged(realBefore)
         assertEquals(1_000L, realXp()["mining"])
+    }
+
+    // ------------------------------------------------------------------ Time Skip concurrency
+    //
+    // These use a session DAO that parks the first Time Skip inside its critical section until
+    // the test releases it, so the interleaving is forced rather than raced: no sleeps, and the
+    // assertions hold on any scheduler.
+
+    /** A [SessionRepository] over an arbitrary [SkillSessionDao], sharing the run's global state. */
+    private fun sessionRepositoryOver(sessionDao: SkillSessionDao): SessionRepository =
+        SessionRepository(sessionDao, context, json, gameData, SimulationPlayerDao(realPlayerDao), playerRepo)
+
+    /** A session DAO wrapper that parks the first [getActiveSession] call on [gate]. */
+    private fun gatedSessionDao(
+        simDao: SimulationSessionDao,
+        reads: AtomicInteger,
+        gate: CompletableDeferred<Unit>,
+        insideFirst: CompletableDeferred<Unit>,
+    ): SkillSessionDao = object : SkillSessionDao by simDao {
+        override suspend fun getActiveSession(): SkillSession? {
+            if (reads.incrementAndGet() == 1) {
+                insideFirst.complete(Unit)
+                gate.await()
+            }
+            return simDao.getActiveSession()
+        }
+    }
+
+    @Test
+    fun `two concurrent time skips cannot process the same frames twice`() = runBlocking {
+        seedBaseReality()
+        val realBefore = realPlayerDao.getPlayer()!!
+        val sessionsBefore = realSessions()
+
+        val reads = AtomicInteger(0)
+        val gate = CompletableDeferred<Unit>()
+        val insideFirst = CompletableDeferred<Unit>()
+        val gatedRepo = sessionRepositoryOver(gatedSessionDao(SimulationSessionDao(realSessionDao), reads, gate, insideFirst))
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+
+        val first = async(Dispatchers.IO) {
+            RealitySimulator.timeSkip(playerRepo, gatedRepo, boostRepo, 60, 1)
+        }
+        withTimeout(10_000) { insideFirst.await() }   // the first skip is inside its critical section
+
+        // A second skip must wait for the lock: it cannot read the session, let alone the cursor.
+        val second = async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.timeSkip(playerRepo, gatedRepo, boostRepo, 60, 1)
+        }
+        assertFalse("a second time skip must not run while the first is in flight", second.isCompleted)
+        assertEquals("the second skip read the session before the first finished", 1, reads.get())
+
+        gate.complete(Unit)
+        val a = withTimeout(10_000) { first.await() }
+        val b = withTimeout(10_000) { second.await() }
+
+        assertEquals(60, a.minutes)
+        assertEquals("the second skip replayed frames the first one already paid", 0, b.minutes)
+
+        // Exactly one session's worth of rewards landed, once.
+        assertEquals(1_000L + 3_000L, simXp()["mining"])
+        assertEquals(5 + 120, simInventory()["iron_ore"])
+        assertEquals(sessionsBefore, realSessions())
+        assertBaseRealityUnchanged(realBefore)
+        assertEquals(1_000L, realXp()["mining"])
+    }
+
+    @Test
+    fun `an exit cannot interleave with a running time skip`() = runBlocking {
+        seedBaseReality()
+        val realBefore = realPlayerDao.getPlayer()!!
+        val sessionsBefore = realSessions()
+
+        val reads = AtomicInteger(0)
+        val gate = CompletableDeferred<Unit>()
+        val insideFirst = CompletableDeferred<Unit>()
+        val gatedRepo = sessionRepositoryOver(gatedSessionDao(SimulationSessionDao(realSessionDao), reads, gate, insideFirst))
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        val skip = async(Dispatchers.IO) {
+            RealitySimulator.timeSkip(playerRepo, gatedRepo, boostRepo, 60, 1)
+        }
+        withTimeout(10_000) { insideFirst.await() }
+
+        // Exit must wait for the skip that is still writing isolated state, not run beside it.
+        val exit = async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
+            RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        }
+        assertFalse("exit must wait for the running time skip", exit.isCompleted)
+        assertTrue("the run must stay active until the exit actually runs", RealitySimulator.isSimulationActive)
+        assertEquals(1, reads.get())
+
+        gate.complete(Unit)
+        val result = withTimeout(10_000) { skip.await() }
+        withTimeout(10_000) { exit.await() }
+
+        // The skip finished before the switch back, and nothing was written after it.
+        assertEquals(60, result.minutes)
+        assertFalse(RealitySimulator.isSimulationActive)
+        assertTrue(RealitySimulator.simSessions.value.isEmpty())
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+        val xpReward = RealitySimulator.rewardPool().first { it.kind == RewardKind.SKILL_XP && it.id == "mining" }
+        assertEquals(3_000L, xpReward.amount)
+
+        assertEquals(sessionsBefore, realSessions())
+        assertBaseRealityUnchanged(realBefore)
+        assertFalse(realSessionDao.getActiveSession()!!.completed)
+        assertEquals(1_000L, realXp()["mining"])
+    }
+
+    @Test
+    fun `a time skip requested after the exit applies nothing`() = runBlocking {
+        seedBaseReality()
+        val realBefore = realPlayerDao.getPlayer()!!
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        assertFalse(RealitySimulator.isSimulationActive)
+
+        val result = RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
+        assertEquals(0, result.minutes)
+        assertEquals(1_000L, simXp()["mining"])
+        assertEquals(5, simInventory()["iron_ore"])
+        assertBaseRealityUnchanged(realBefore)
+    }
+
+    // ------------------------------------------------------------------ character replacement
+
+    @Test
+    fun `importing another character invalidates a pending checkpoint`() = runBlocking {
+        seedBaseReality()
+        val characterA = playerRepo.exportSave(emptyList())
+        // Character B: a different save loaded into the same slot.
+        playerRepo.resetProgression()
+        val characterB = playerRepo.exportSave(emptyList())
+        playerRepo.importSave(characterA)
+
+        // Run as A, then swap the current character for B with rewards still pending.
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
+        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        val pool = RealitySimulator.rewardPool()
+        assertTrue("the run should have rewards pending", pool.isNotEmpty())
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+
+        saveSlotRepo.importFullSave(characterB)
+        val coinsAfterImport = realPlayerDao.getPlayer()!!.coins
+        val xpAfterImport = realXp()
+        val inventoryAfterImport = realInventory()
+
+        // The checkpoint belonged to A: B must not be able to claim a single reward from it.
+        assertTrue("A's checkpoint survived the import", RealitySimulator.rewardPool().isEmpty())
+        assertTrue(RealitySimulator.runInvalidated.value)
+        assertEquals(Phase.BASE_REALITY, RealitySimulator.phase.value)
+        assertTrue(RealitySimulator.claimRewards(playerRepo, pool.take(3), 1))
+
+        // B's save is exactly as the import left it — none of A's gains crossed over.
+        assertEquals(coinsAfterImport, realPlayerDao.getPlayer()!!.coins)
+        assertEquals(xpAfterImport, realXp())
+        assertEquals(inventoryAfterImport, realInventory())
+        assertEquals(0L, json.decodeFromString<PlayerFlags>(realPlayerDao.getPlayer()!!.flags).simRunActiveSince)
+    }
+
+    @Test
+    fun `resetting progression invalidates a pending checkpoint`() = runBlocking {
+        seedBaseReality()
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
+        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+        val pool = RealitySimulator.rewardPool()
+        assertTrue(pool.isNotEmpty())
+
+        playerRepo.resetProgression()
+
+        assertTrue(RealitySimulator.rewardPool().isEmpty())
+        assertTrue(RealitySimulator.runInvalidated.value)
+        assertEquals(Phase.BASE_REALITY, RealitySimulator.phase.value)
+        assertFalse("a reset character must not own the old run", RealitySimulator.ownsRun(1))
+        assertTrue(RealitySimulator.claimRewards(playerRepo, pool.take(3), 1))
+
+        // A fresh character: none of the simulated mining XP or loot crossed over.
+        assertEquals(0L, realXp()["mining"])
+        assertNull(realInventory()["iron_ore"])
+        assertEquals(0L, json.decodeFromString<PlayerFlags>(realPlayerDao.getPlayer()!!.flags).simRunActiveSince)
+    }
+
+    @Test
+    fun `a run active while the character is replaced cannot keep writing simulated state`() = runBlocking {
+        seedBaseReality()
+        val characterA = playerRepo.exportSave(emptyList())
+        playerRepo.resetProgression()
+        val characterB = playerRepo.exportSave(emptyList())
+        playerRepo.importSave(characterA)
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
+        assertTrue(RealitySimulator.isSimulationActive)
+
+        saveSlotRepo.importFullSave(characterB)
+
+        assertFalse(RealitySimulator.isSimulationActive)
+        assertTrue(RealitySimulator.simSessions.value.isEmpty())
+        assertNull(RealitySimulator.simPlayer.value)
+        assertEquals(Phase.BASE_REALITY, RealitySimulator.phase.value)
+        // The import hit Base Reality, not the temporary state: the imported character is the
+        // one now loaded, with none of the simulated gains on it.
+        val importedB: PlayerExport = json.decodeFromString(characterB)
+        assertEquals(json.decodeFromString<Map<String, Long>>(importedB.skillXp), realXp())
+        assertEquals(json.decodeFromString<Map<String, Int>>(importedB.inventory), realInventory())
+        assertEquals(importedB.coins, realPlayerDao.getPlayer()!!.coins)
+        assertNull(realInventory()["iron_ore"])
+    }
+
+    // ------------------------------------------------------------------ atomic reward claim
+
+    @Test
+    fun `a reward that fails to apply rolls the whole payout back and keeps the checkpoint`() = runBlocking {
+        seedBaseReality()
+        val realBefore = realPlayerDao.getPlayer()!!
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
+        RealitySimulator.exitSimulation(playerRepo, sessionRepo, 1)
+
+        val pool = RealitySimulator.rewardPool()
+        val itemReward = pool.first { it.kind == RewardKind.ITEM && it.id == "iron_ore" }
+        val xpReward = pool.first { it.kind == RewardKind.SKILL_XP && it.id == "mining" }
+        // A negative coin grant fails exactly like a real write failure would.
+        val failingReward = RealitySimulator.SimReward(RewardKind.STATS, RealitySimulator.COINS_ID, -1L)
+
+        assertFalse(RealitySimulator.claimRewards(playerRepo, listOf(itemReward, failingReward), 1))
+
+        // Nothing was kept: the item that applied first was rolled back with the failure.
+        assertEquals("a failed claim left a partial payout in base reality", 5, realInventory()["iron_ore"])
+        assertEquals(1_000L, realXp()["mining"])
+        assertEquals(1_000L, realPlayerDao.getPlayer()!!.coins)
+        assertBaseRealityUnchanged(realBefore)
+
+        // The run is still recoverable: the same rewards can be claimed again.
+        assertEquals(Phase.REWARD_SELECTION, RealitySimulator.phase.value)
+        assertTrue(RealitySimulator.crashedLastRun.value)
+        assertEquals(pool, RealitySimulator.rewardPool())
+        assertTrue(RealitySimulator.claimRewards(playerRepo, listOf(itemReward, xpReward), 1))
+        assertEquals(5 + 120, realInventory()["iron_ore"])
+        assertEquals(1_000L + 3_000L, realXp()["mining"])
+        assertEquals(Phase.BASE_REALITY, RealitySimulator.phase.value)
+    }
+
+    // ------------------------------------------------------------------ fail-closed entry
+
+    @Test
+    fun `a session snapshot failure does not start an empty simulation`() = runBlocking {
+        seedBaseReality()
+        val realBefore = realPlayerDao.getPlayer()!!
+        val sessionsBefore = realSessions()
+
+        val failingDao = object : SkillSessionDao by realSessionDao {
+            override suspend fun getAllSessions(): List<SkillSession> = error("session read failed")
+        }
+        val failingRepo = sessionRepositoryOver(failingDao)
+
+        RealitySimulator.enterSimulation(playerRepo, failingRepo, 1)
+
+        assertFalse("a failed session snapshot must not start a run", RealitySimulator.isSimulationActive)
+        assertTrue(RealitySimulator.crashedLastRun.value)
+        assertEquals(Phase.BASE_REALITY, RealitySimulator.phase.value)
+        assertNull(RealitySimulator.simPlayer.value)
+        assertTrue(RealitySimulator.simSessions.value.isEmpty())
+        assertFalse(RealitySimulator.ownsRun(1))
+        assertTrue(RealitySimulator.rewardPool().isEmpty())
+        // Fail closed, and fail loudly: no crash marker, no empty parallel run.
+        assertEquals(0L, json.decodeFromString<PlayerFlags>(realPlayerDao.getPlayer()!!.flags).simRunActiveSince)
+        assertEquals(sessionsBefore, realSessions())
+        assertBaseRealityUnchanged(realBefore)
+    }
+
+    // ------------------------------------------------------------------ Time Skip / collect parity
+
+    @Test
+    fun `a time skip pays the same item yield multipliers a normal collect does`() = runBlocking {
+        val base = seedBaseReality()
+        realPlayerDao.upsert(
+            realPlayerDao.getPlayer()!!.copy(
+                flags = encodeFlags(PlayerFlags(prestigeNodes = mapOf("mining" to listOf("mining_yield_1")))),
+            )
+        )
+        sessionRepo.deleteAllSessions()
+        seedSession("yield_run", "mining", "iron_ore", miningFrames(), base)
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        val result = RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 60, 1)
+
+        // +5% prestige yield on 120 ore, exactly like collectGenericSkillSession.
+        assertEquals(126, result.items["iron_ore"])
+        assertEquals(5 + 126, simInventory()["iron_ore"])
+        assertEquals(1_000L, realXp()["mining"])
+        assertEquals(5, realInventory()["iron_ore"])
+    }
+
+    @Test
+    fun `a boss time skip pays the daily coin soft cap after the full-coin kills`() = runBlocking {
+        val base = seedBaseReality()
+
+        RealitySimulator.enterSimulation(playerRepo, sessionRepo, 1)
+        var coins = 0L
+        repeat(4) { index ->
+            sessionRepo.insertSession(
+                SkillSession(
+                    sessionId   = "boss_$index",
+                    skillName   = "boss",
+                    activityKey = "sea_serpent",
+                    startedAt   = base + 60_000L * (index + 1),
+                    endsAt      = base + 60_000L * (index + 1) + 1_800_000L,
+                    frames      = encodeFrames(bossFrames(win = true)),
+                )
+            )
+            val result = RealitySimulator.timeSkip(playerRepo, sessionRepo, boostRepo, 30, 1)
+            assertFalse(result.died)
+            coins += result.coins
+        }
+
+        // Three full-coin kills, then the soft cap (0.25) on the fourth.
+        assertEquals(500L + 500L + 500L + 125L, coins)
+        assertEquals(1_000L + 1_625L, playerRepo.getOrCreatePlayer().coins)
+        assertEquals(1_000L, realPlayerDao.getPlayer()!!.coins)
     }
 }

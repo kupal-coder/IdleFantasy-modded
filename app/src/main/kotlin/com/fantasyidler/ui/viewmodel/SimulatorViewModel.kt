@@ -138,8 +138,14 @@ class SimulatorViewModel @Inject constructor(
 
     fun cancelTimeSkip() = RealitySimulator.cancelTimeSkip()
 
+    /** True while a Time Skip is in flight: a second tap must not queue a second skip. */
+    @Volatile
+    private var skipInProgress = false
+
     fun confirmTimeSkip(minutes: Int) {
+        if (skipInProgress) return
         viewModelScope.launch {
+            skipInProgress = true
             try {
                 if (!RealitySimulator.canTimeSkip()) {
                     _extra.update { it.copy(message = context.withAppLocale().getString(R.string.simulator_time_skip_unavailable)) }
@@ -165,6 +171,8 @@ class SimulatorViewModel @Inject constructor(
                 }
             } catch (e: Exception) {
                 abortWithCrashMessage()
+            } finally {
+                skipInProgress = false
             }
         }
     }

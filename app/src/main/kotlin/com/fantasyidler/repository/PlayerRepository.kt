@@ -11,6 +11,7 @@ import com.fantasyidler.data.model.*
 import com.fantasyidler.simulator.HeirloomStats
 import com.fantasyidler.simulator.PrestigeBoosts
 import com.fantasyidler.simulator.PrestigePoints
+import com.fantasyidler.simulator.RealitySimulator
 import com.fantasyidler.simulator.SkillSimulator
 import com.fantasyidler.simulator.XpTable
 import com.fantasyidler.ui.viewmodel.combatLevelFrom
@@ -209,6 +210,18 @@ class PlayerRepository @Inject constructor(
         sessionId: String? = null,
         applyXpBoosts: Boolean = true,
     ): List<String> = playerMutex.withLock {
+        applySessionResultsUnlocked(skillName, xpGained, itemsGained, efficiencyMultiplier, sessionId, applyXpBoosts)
+    }
+
+    /** Lock-free variant for callers already inside [playerMutex] (or [inPlayerTransaction]). */
+    internal suspend fun applySessionResultsUnlocked(
+        skillName: String,
+        xpGained: Long,
+        itemsGained: Map<String, Int>,
+        efficiencyMultiplier: Float = 1.0f,
+        sessionId: String? = null,
+        applyXpBoosts: Boolean = true,
+    ): List<String> {
         val player    = getOrCreatePlayer()
         val flags: PlayerFlags = json.decodeFromString(player.flags)
         // Sigil stones apply game-wide, so mainland collects pick up the same xp/loot mults
@@ -557,7 +570,7 @@ class PlayerRepository @Inject constructor(
     /** Adds qty of item to the player's inventory at no coin cost (prize/drop grant). */
     suspend fun grantItem(key: String, qty: Int = 1) = playerMutex.withLock { grantItemUnlocked(key, qty) }
 
-    private suspend fun grantItemUnlocked(key: String, qty: Int = 1) {
+    internal suspend fun grantItemUnlocked(key: String, qty: Int = 1) {
         require(qty >= 0) { "Cannot grant negative quantity" }
         val player = getOrCreatePlayer()
         val inventory: MutableMap<String, Int> = json.decodeFromString(player.inventory)
@@ -672,6 +685,17 @@ class PlayerRepository @Inject constructor(
     }
 
     suspend fun <T> withLock(block: suspend () -> T): T = playerMutex.withLock { block() }
+
+    /**
+     * Runs [block] as one all-or-nothing player write: nothing else can write the player row
+     * while it runs, and if it throws, every write inside is rolled back. Used where a group of
+     * separate player updates must land together or not at all (the Simulator's reward claim:
+     * a partially applied payout would keep some rewards and lose the rest).
+     *
+     * [block] must only use the `*Unlocked` helpers — [playerMutex] is not reentrant.
+     */
+    suspend fun <T> inPlayerTransaction(block: suspend () -> T): T =
+        playerMutex.withLock { appDatabase.withTransaction { block() } }
 
     internal suspend fun updateFlagsUnlocked(flags: PlayerFlags) {
         // Single-column update: replacing the whole row rewrote every JSON blob and made
@@ -1622,33 +1646,40 @@ class PlayerRepository @Inject constructor(
      * An ironman save whose signature is missing or does not match its core fields was edited
      * outside the game; it still imports, but as a regular (non-ironman) character.
      */
-    suspend fun importSave(jsonString: String): ImportedSave = playerMutex.withLock {
-        var export = json.decodeFromString<PlayerExport>(stripJsonGarbage(jsonString))
-        var ironmanDemoted = false
-        val importedFlags = try { json.decodeFromString<PlayerFlags>(export.flags) } catch (_: Exception) { null }
-        if (importedFlags?.ironman == true && export.sig != saveSignature(export)) {
-            export = export.copy(flags = json.encode<PlayerFlags>(importedFlags.copy(ironman = false)))
-            ironmanDemoted = true
-        }
-        appDatabase.withTransaction {
-            val player = getOrCreatePlayer()
-            playerDao.upsert(
-                player.copy(
-                    skillLevels = export.skillLevels,
-                    skillXp     = export.skillXp,
-                    inventory   = export.inventory,
-                    equipped    = export.equipped,
-                    flags       = export.flags,
-                    pets        = export.pets,
-                    coins       = export.coins,
+    suspend fun importSave(jsonString: String): ImportedSave {
+        // A Simulator run is checkpointed from the character this import is about to replace:
+        // importing another character invalidates the run, so its rewards can never be claimed
+        // onto a different save. Must run before the import — afterwards the import's own
+        // writes would land in the temporary simulation state instead of Base Reality.
+        RealitySimulator.invalidateRunForReplacement()
+        return playerMutex.withLock {
+            var export = json.decodeFromString<PlayerExport>(stripJsonGarbage(jsonString))
+            var ironmanDemoted = false
+            val importedFlags = try { json.decodeFromString<PlayerFlags>(export.flags) } catch (_: Exception) { null }
+            if (importedFlags?.ironman == true && export.sig != saveSignature(export)) {
+                export = export.copy(flags = json.encode<PlayerFlags>(importedFlags.copy(ironman = false)))
+                ironmanDemoted = true
+            }
+            appDatabase.withTransaction {
+                val player = getOrCreatePlayer()
+                playerDao.upsert(
+                    player.copy(
+                        skillLevels = export.skillLevels,
+                        skillXp     = export.skillXp,
+                        inventory   = export.inventory,
+                        equipped    = export.equipped,
+                        flags       = export.flags,
+                        pets        = export.pets,
+                        coins       = export.coins,
+                    )
                 )
-            )
-            questProgressDao.deleteAll()
-            export.questProgress.forEach { questProgressDao.upsert(it) }
-            farmingPatchDao.clearAll()
-            export.farmingPatches.forEach { farmingPatchDao.upsert(it) }
+                questProgressDao.deleteAll()
+                export.questProgress.forEach { questProgressDao.upsert(it) }
+                farmingPatchDao.clearAll()
+                export.farmingPatches.forEach { farmingPatchDao.upsert(it) }
+            }
+            ImportedSave(export, ironmanDemoted)
         }
-        ImportedSave(export, ironmanDemoted)
     }
 
     /**
@@ -1688,6 +1719,9 @@ class PlayerRepository @Inject constructor(
     }
 
     suspend fun resetProgression(ironman: Boolean = false) {
+        // Same rule as [importSave]: resetting replaces the character a Simulator run was
+        // checkpointed from, so the run and its claimable rewards die with it.
+        RealitySimulator.invalidateRunForReplacement()
         val previousFlags = playerDao.getPlayer()?.let { player ->
             try { json.decodeFromString<PlayerFlags>(player.flags) } catch (_: Exception) { null }
         }
