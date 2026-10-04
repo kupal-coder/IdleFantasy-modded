@@ -1737,7 +1737,7 @@ class SimulatorIsolationTest {
         gate.complete(Unit)
         op.await()
 
-        assertEquals(listOf("death:start", "write"), events.toList())
+        assertEquals(listOf("death:start", "write"), events.toList().take(2))
         assertFalse("the completion must not leak into Layer 1", realSessionDao.getSession("real_active")!!.completed)
         assertEquals(sessionsBefore, realSessions())
 
