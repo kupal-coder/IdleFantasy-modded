@@ -54,7 +54,7 @@ class SessionRepository @Inject constructor(
 
     /** Runs [block] while holding the same lifecycle boundary [sessionOp] uses. */
     suspend fun <T> withSessionLock(block: suspend () -> T): T =
-        playerRepo.playerMutex.withLock(block)
+        playerRepo.withLock(block)
 
     suspend fun getActiveSession(playerMutexHeld: Boolean = false): SkillSession? =
         sessionOp(playerMutexHeld) { sessionDao.getActiveSession() }

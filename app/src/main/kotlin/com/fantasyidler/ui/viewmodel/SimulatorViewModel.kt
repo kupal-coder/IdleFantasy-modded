@@ -183,7 +183,7 @@ class SimulatorViewModel @Inject constructor(
     fun claimRewards() {
         viewModelScope.launch {
             try {
-                val claimed = RealitySimulator.claimRewards(playerRepo, uiState.value.selectedRewards, activeSlot())
+                val claimed = RealitySimulator.claimRewards(playerRepo, uiState.value.selectedRewards.toList(), activeSlot())
                 _extra.update {
                     it.copy(
                         selectedRewards = emptySet(),
