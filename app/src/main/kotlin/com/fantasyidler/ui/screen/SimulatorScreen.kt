@@ -76,6 +76,11 @@ fun SimulatorScreen(
             AppBannerCenter.enqueue(context.getString(R.string.simulator_error)) { viewModel.consumeCrashNotice() }
         }
     }
+    LaunchedEffect(state.runInvalidated) {
+        if (state.runInvalidated) {
+            AppBannerCenter.enqueue(context.getString(R.string.simulator_invalid_run)) { viewModel.consumeInvalidRunNotice() }
+        }
+    }
 
     Scaffold(
         contentWindowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal),
